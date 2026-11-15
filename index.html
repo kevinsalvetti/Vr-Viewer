@@ -4534,7 +4534,7 @@ function teleport(p){
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
   const ctrlLine = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
-  ctrlLine.scale.z = 5; ctrlLine.visible = false; c.add(ctrlLine); c.userData.line = ctrlLine;
+  ctrlLine.scale.z = 5; ctrlLine.visible = false; c.add(ctrlLine); c.userData.line = c.userData.ctrlLine = ctrlLine;
   const handRay = makeHandRay(); c.add(handRay); c.userData.handRay = handRay;
   c.addEventListener('connected', e => {
     c.userData.isHand = !!(e.data && e.data.hand);
@@ -4665,9 +4665,10 @@ function b64ToBuffer(s){ const b = atob(s), u = new Uint8Array(b.length); for (l
 // carica il modello della mano giusta (destra/sinistra) quando il visore la riconosce
 function buildHandVisual(st){
   const handed = st.handed;
-  st.vis = { handed, ready: false };
+  if (st.handRoot) { st.hand.remove(st.handRoot); st.handRoot = null; }   // via subito il modello vecchio
+  const token = st.vis = { handed, ready: false };
   new THREE.GLTFLoader().parse(b64ToBuffer(HAND_GLB[handed]), '', gltf => {
-    if (st.handed !== handed) return;
+    if (st.vis !== token) return;                     // nel frattempo la mano e' cambiata: risultato vecchio
     const root = gltf.scene, src = root.getObjectByProperty('type', 'SkinnedMesh');
     const mats = makeHandMaterials();
     // 3 passate sulla stessa geometria: profondita' -> bordo (solo dove sporge) -> riempimento
@@ -4679,8 +4680,7 @@ function buildHandVisual(st){
     make(mats.depth, 10); make(mats.edge, 11); make(mats.fill, 12);
     src.parent.remove(src);
     const bones = {}; HAND_JOINTS.forEach(n => { bones[n] = root.getObjectByName(n); });
-    if (st.vis.root) st.hand.remove(st.vis.root);
-    st.hand.add(root);
+    st.hand.add(root); st.handRoot = root;
     st.vis = { handed, ready: true, root, mats, bones };
   }, e => console.error('Modello mano:', e));
 }
@@ -4728,10 +4728,31 @@ const handStates = [];
 for (let i = 0; i < 2; i++) {
   const hand = renderer.xr.getHand(i);
   rig.add(hand);
-  const st = { hand, handed: null, pinching: false, pinchStrength: 0, anchor: new THREE.Vector3(), vis: null };
-  hand.addEventListener('connected', e => { st.handed = (e.data && e.data.hand) ? e.data.handedness : null; });
+  const st = { hand, handed: null, pinching: false, pinchStrength: 0, anchor: new THREE.Vector3(), vis: null, handRoot: null };
   hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = false; st.pinchStrength = 0; });
   handStates.push(st);
+}
+
+// three.js abbina le sorgenti (mani/controller) agli slot 0 e 1 secondo l'ordine in session.inputSources,
+// che cambia quando il visore perde e ritrova una mano, ma avvisa solo lo slot nuovo. Per non avere
+// una mano "sinistra" che segue la destra (mani fantasma in pose strane), ricontrolliamo ogni fotogramma.
+function syncInputSources(){
+  const session = renderer.xr.getSession();
+  if (!session) return;
+  for (let i = 0; i < 2; i++) {
+    const src = session.inputSources[i];
+    const isHand = !!(src && src.hand);
+    const handed = isHand ? src.handedness : null;
+    const st = handStates[i];
+    if (st.handed !== handed) { st.handed = handed; st.pinching = false; st.pinchStrength = 0; }
+    const c = renderer.xr.getController(i), want = isHand ? c.userData.handRay : c.userData.ctrlLine;
+    c.userData.isHand = isHand;
+    if (want && c.userData.line !== want) {
+      if (aim.c === c) { aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false; }
+      if (doorPress && doorPress.c === c) doorPress = null;
+      c.userData.line.visible = false; c.userData.line = want;
+    }
+  }
 }
 const hf = new THREE.Vector3(), hr = new THREE.Vector3(), hd3 = new THREE.Vector3();
 const hz = v => Math.sign(v) * Math.min(Math.max((Math.abs(v) - 0.03) / 0.12, 0), 1);   // zona morta 3 cm, massimo a 15 cm
@@ -4781,6 +4802,7 @@ function updateHandRays(){
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
+  try { syncInputSources(); } catch (e) {}
   try { locomotion(dt); updateAim(t); updateDoors(dt); } catch (e) {}
   try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
   renderer.render(scene, camera);
