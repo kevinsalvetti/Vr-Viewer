@@ -29,6 +29,9 @@
   <input type="number" id="rx" value="0" step="90" style="width:70px">
   <input type="number" id="ry" value="0" step="90" style="width:70px">
   <input type="number" id="rz" value="0" step="90" style="width:70px">
+  <label>Rotazione con lo stick destro</label>
+  <select id="turnMode"><option value="smooth">Fluida</option><option value="snap">A scatti (30°)</option></select>
+  <input type="number" id="turnSpeed" value="90" step="10" min="10" max="360" style="width:70px"> gradi/s (fluida)
   <div id="status">Nessun modello caricato.</div>
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
@@ -4380,6 +4383,15 @@ const dead = 0.15;
 let snapReady = true;
 const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vector3(0,1,0);
 
+const turnModeEl = document.getElementById('turnMode');
+const turnSpeedEl = document.getElementById('turnSpeed');
+// ruota il "rig" attorno alla posizione della testa, così la vista non "sbanda"
+function rotateAboutHead(angle){
+  const head = new THREE.Vector3().setFromMatrixPosition(renderer.xr.getCamera(camera).matrixWorld);
+  rig.position.sub(head).applyAxisAngle(up, angle).add(head);
+  rig.rotation.y += angle;
+}
+
 function locomotion(dt){
   const session = renderer.xr.getSession();
   if (!session) return;
@@ -4397,9 +4409,15 @@ function locomotion(dt){
       if (Math.abs(x) > dead) rig.position.addScaledVector(right, x * 2 * boost * dt);
       if (Math.abs(y) > dead) rig.position.addScaledVector(fwd, -y * 2 * boost * dt);
     } else if (src.handedness === 'right') {
-      if (Math.abs(x) > 0.7) {
+      if (turnModeEl.value === 'smooth') {
+        if (Math.abs(x) > dead) {
+          const k = (Math.abs(x) - dead) / (1 - dead) * Math.sign(x);   // 0..1 con zona morta
+          const speed = (parseFloat(turnSpeedEl.value) || 90) * Math.PI / 180;
+          rotateAboutHead(-k * speed * dt);
+        }
+      } else if (Math.abs(x) > 0.7) {
         if (snapReady) {
-          rig.rotation.y += (x > 0 ? -1 : 1) * Math.PI / 6;  // 30°
+          rotateAboutHead((x > 0 ? -1 : 1) * Math.PI / 6);  // 30°
           snapReady = false;
         }
       } else if (Math.abs(x) < 0.3) snapReady = true;
