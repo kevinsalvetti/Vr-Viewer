@@ -36,7 +36,8 @@
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
-  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi</div>
+  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi
+  <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · tieni premuto 1 secondo = cardine sull'altro lato</div>
 </div>
 
 <script>
@@ -4350,8 +4351,10 @@ function loadFile(f){
       (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.side = THREE.DoubleSide);
     }});
     scene.add(model);
+    model.userData.fileName = f.name;
+    setupDoors();
     place();
-    statusEl.textContent = 'Caricato: ' + f.name + '. Premi "Enter VR".';
+    statusEl.textContent = 'Caricato: ' + f.name + (doors.length ? ' (' + doors.length + ' porte apribili)' : '') + '. Premi "Enter VR".';
   }, undefined, e => { statusEl.textContent = 'Errore: ' + (e.message || e); });
 }
 
@@ -4442,6 +4445,77 @@ marker.visible = false; marker.renderOrder = 999; scene.add(marker);
 const aim = { c: null, hit: null, ok: false, t: 0 };
 const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
 
+// ---- Porte apribili (create dal convertitore: nodi "PORTA:..." con asse e larghezza dell'anta) ----
+// Punta una porta e premi grilletto / fai la pinza = apri o chiudi (si apre sempre allontanandosi da te).
+// Tieni premuto almeno 0,7 s = sposta il cardine sull'altro lato (viene ricordato per quel modello).
+const doors = [];
+const LONG_PRESS = 700;
+let doorPress = null;
+const _T = new THREE.Matrix4(), _R = new THREE.Matrix4(), _h = new THREE.Vector3();
+const doorKey = () => 'vrviewer-porte:' + ((model && model.userData.fileName) || '');
+function loadDoorSides(){ try { return JSON.parse(localStorage.getItem(doorKey())) || {}; } catch (e) { return {}; } }
+function saveDoorSides(){
+  try {
+    const o = {}; doors.forEach(d => { if (d.side !== 1) o[d.obj.name] = d.side; });
+    localStorage.setItem(doorKey(), JSON.stringify(o));
+  } catch (e) {}
+}
+function setupDoors(){
+  doors.length = 0; doorPress = null;
+  const sides = loadDoorSides();
+  model.traverse(o => {
+    const u = o.userData;
+    if (!u || !u.porta || !u.asse || !u.larghezza) return;
+    o.updateMatrix();
+    doors.push({ obj: o, M0: o.matrix.clone(),
+      axis: new THREE.Vector3().fromArray(u.asse).normalize(),
+      w: new THREE.Vector3().fromArray(u.larghezza).normalize(),
+      half: u.meta || 0.4, side: sides[o.name] === -1 ? -1 : 1, angle: 0, target: 0 });
+  });
+}
+function applyDoor(d){
+  _h.copy(d.w).multiplyScalar(d.side * d.half);          // cardine: un bordo verticale dell'anta
+  d.obj.matrix.copy(d.M0)
+    .multiply(_T.makeTranslation(_h.x, _h.y, _h.z))
+    .multiply(_R.makeRotationAxis(d.axis, d.angle))
+    .multiply(_T.makeTranslation(-_h.x, -_h.y, -_h.z))
+    .decompose(d.obj.position, d.obj.quaternion, d.obj.scale);
+}
+function toggleDoor(d, flip){
+  if (flip) { d.side = -d.side; d.angle = 0; applyDoor(d); saveDoorSides(); }
+  else if (d.target !== 0) { d.target = 0; return; }
+  // da che parte sei rispetto alla porta chiusa? la porta si apre dalla parte opposta
+  const head = new THREE.Vector3().setFromMatrixPosition(
+    (renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera).matrixWorld);
+  d.obj.parent.updateMatrixWorld(true);
+  head.applyMatrix4(new THREE.Matrix4().multiplyMatrices(d.obj.parent.matrixWorld, d.M0).invert());
+  const n = new THREE.Vector3().crossVectors(d.axis, d.w);
+  d.target = d.side * (head.dot(n) >= 0 ? 1 : -1) * Math.PI / 2;
+}
+function updateDoors(dt){
+  for (const d of doors) {
+    if (d.angle === d.target) continue;
+    const diff = d.target - d.angle, step = 2.2 * dt;    // circa 0,7 s per aprirsi del tutto
+    d.angle = Math.abs(diff) <= step ? d.target : d.angle + Math.sign(diff) * step;
+    applyDoor(d);
+  }
+  if (doorPress && performance.now() - doorPress.t0 >= LONG_PRESS)
+    doorPress.c.userData.line.material.color.set(0xff8a00);   // arancio: al rilascio cambia lato del cardine
+}
+function doorOf(o){
+  for (; o && o !== model; o = o.parent) if (o.userData.porta) return doors.find(d => d.obj === o) || null;
+  return null;
+}
+function pickDoor(c){
+  if (!model || !doors.length) return null;
+  c.updateMatrixWorld(true);
+  ray.set(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld),
+          new THREE.Vector3(0, 0, -1).transformDirection(c.matrixWorld));
+  const h = ray.intersectObject(model, true)[0];
+  const d = h && h.distance < 6 && doorOf(h.object);
+  return d ? { door: d, dist: h.distance } : null;
+}
+
 function teleport(p){
   const xrCam = renderer.xr.getCamera(camera);
   const head = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
@@ -4460,9 +4534,23 @@ for (let i = 0; i < 2; i++) {
     ctrlLine.visible = handRay.visible = false;
     c.userData.line = c.userData.isHand ? handRay : ctrlLine;
   });
-  c.addEventListener('selectstart', () => { aim.c = c; aim.t = 0; c.userData.line.visible = true; });
+  c.addEventListener('selectstart', () => {
+    const line = c.userData.line;
+    const p = pickDoor(c);
+    if (p) {                                        // puntando una porta: apri/chiudi invece del teletrasporto
+      doorPress = { c, door: p.door, t0: performance.now() };
+      line.visible = true; line.scale.z = p.dist; line.material.color.set(0xffd34d);
+      return;
+    }
+    aim.c = c; aim.t = 0; line.visible = true; line.material.color.set(0xffffff);
+  });
   c.addEventListener('selectend', () => {
     c.userData.line.visible = false;
+    if (doorPress && doorPress.c === c) {
+      toggleDoor(doorPress.door, performance.now() - doorPress.t0 >= LONG_PRESS);
+      doorPress = null;
+      return;
+    }
     if (aim.c === c) {
       if (aim.ok && aim.hit) teleport(aim.hit);
       aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false;
@@ -4685,7 +4773,7 @@ function updateHandRays(){
     if (!ray || !c.userData.isHand) continue;
     const s = handStates[i].pinchStrength;
     ray.material.uniforms.opacity.value = 0.25 + 0.6 * s;
-    if (aim.c === c) continue;                      // durante il teletrasporto lo gestisce updateAim
+    if (aim.c === c || (doorPress && doorPress.c === c)) continue;   // teletrasporto / porta: gestiti altrove
     ray.visible = true; ray.scale.z = 0.6; ray.material.color.set(0xffffff);
   }
 }
@@ -4693,7 +4781,7 @@ function updateHandRays(){
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
-  try { locomotion(dt); updateAim(t); } catch (e) {}
+  try { locomotion(dt); updateAim(t); updateDoors(dt); } catch (e) {}
   try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
   renderer.render(scene, camera);
 });

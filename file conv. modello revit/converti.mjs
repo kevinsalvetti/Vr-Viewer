@@ -57,18 +57,68 @@ if (ext === '.obj') {
   console.error('Formato non supportato: ' + ext + ' (usa .obj, .fbx, .glb o .gltf)'); process.exit(1);
 }
 
-// 2b) rotazione del modello (es. Revit usa Z verso l'alto: ROTX=-90 lo raddrizza)
-let toRotate = null;
-if (rot.some(v => v !== 0)) {
-  console.log('\nApplico la rotazione X/Y/Z = ' + rot.join(' / ') + ' gradi...');
-  const req = createRequire(path.join(here, 'noop.js'));
-  const { NodeIO } = req('@gltf-transform/core');
-  const { KHRDracoMeshCompression } = req('@gltf-transform/extensions');
-  const draco3d = req('draco3dgltf');
-  const io = new NodeIO().registerExtensions([KHRDracoMeshCompression])
-    .registerDependencies({ 'draco3d.decoder': await draco3d.createDecoderModule() });
-  const doc = await io.read(source);
-  doc.getRoot().listExtensionsUsed().forEach(e => { if (e.extensionName === 'KHR_draco_mesh_compression') e.dispose(); });
+// 2b) porte apribili + rotazione del modello
+const req = createRequire(path.join(here, 'noop.js'));
+const { NodeIO } = req('@gltf-transform/core');
+const { KHRDracoMeshCompression } = req('@gltf-transform/extensions');
+const draco3d = req('draco3dgltf');
+const io = new NodeIO().registerExtensions([KHRDracoMeshCompression])
+  .registerDependencies({ 'draco3d.decoder': await draco3d.createDecoderModule() });
+const doc = await io.read(source);
+doc.getRoot().listExtensionsUsed().forEach(e => { if (e.extensionName === 'KHR_draco_mesh_compression') e.dispose(); });
+
+// Porte: i gruppi il cui nome contiene uno dei tipi in PORTE; l'anta e' la parte col materiale ANTA.
+// Ogni anta diventa un oggetto separato "PORTA:<nome>" con le informazioni per farla ruotare nel viewer.
+const norm = s => String(s || '').replace(/\s+/g, '').toLowerCase();
+const doorTypes = norm(process.env.PORTE ?? '80x210').split(',').filter(t => t && t !== 'nessuna');
+const leafMat = norm(process.env.ANTA ?? 'ante');
+let doors = 0;
+const doorNodes = new Set();
+for (const node of doc.getRoot().listNodes()) {
+  const mesh = node.getMesh();
+  if (!mesh || !doorTypes.some(t => norm(node.getName()).includes(t))) continue;
+  for (const prim of mesh.listPrimitives()) {
+    if (!norm(prim.getMaterial() && prim.getMaterial().getName()).includes(leafMat)) continue;
+    const pos = prim.getAttribute('POSITION'), cnt = pos.getCount(), v = [0, 0, 0];
+    const mn = [Infinity, Infinity, Infinity], mx = [-Infinity, -Infinity, -Infinity];
+    for (let i = 0; i < cnt; i++) { pos.getElement(i, v); for (let k = 0; k < 3; k++) { mn[k] = Math.min(mn[k], v[k]); mx[k] = Math.max(mx[k], v[k]); } }
+    const ext = mx.map((x, k) => x - mn[k]);
+    const up = ext.indexOf(Math.max(...ext));              // l'altezza e' la dimensione maggiore
+    const [a, b] = [0, 1, 2].filter(k => k !== up);
+    // direzione della larghezza nel piano orizzontale (analisi delle componenti principali, vale anche per muri inclinati)
+    let ma = 0, mb = 0; for (let i = 0; i < cnt; i++) { pos.getElement(i, v); ma += v[a]; mb += v[b]; } ma /= cnt; mb /= cnt;
+    let caa = 0, cbb = 0, cab = 0;
+    for (let i = 0; i < cnt; i++) { pos.getElement(i, v); const x = v[a] - ma, y = v[b] - mb; caa += x * x; cbb += y * y; cab += x * y; }
+    const phi = 0.5 * Math.atan2(2 * cab, caa - cbb), w2 = [Math.cos(phi), Math.sin(phi)], n2 = [-w2[1], w2[0]];
+    let w0 = Infinity, w1 = -Infinity, t0 = Infinity, t1 = -Infinity;
+    for (let i = 0; i < cnt; i++) {
+      pos.getElement(i, v);
+      const pw = v[a] * w2[0] + v[b] * w2[1], pn = v[a] * n2[0] + v[b] * n2[1];
+      w0 = Math.min(w0, pw); w1 = Math.max(w1, pw); t0 = Math.min(t0, pn); t1 = Math.max(t1, pn);
+    }
+    const cw = (w0 + w1) / 2, cn = (t0 + t1) / 2, c = [0, 0, 0], wdir = [0, 0, 0], updir = [0, 0, 0];
+    c[a] = cw * w2[0] + cn * n2[0]; c[b] = cw * w2[1] + cn * n2[1]; c[up] = mn[up];
+    wdir[a] = w2[0]; wdir[b] = w2[1]; updir[up] = 1;
+    // sposta i vertici dell'anta attorno al suo centro (in basso), cosi' il nodo puo' ruotare
+    const p2 = pos.clone();
+    for (let i = 0; i < cnt; i++) { pos.getElement(i, v); p2.setElement(i, [v[0] - c[0], v[1] - c[1], v[2] - c[2]]); }
+    const leaf = prim.clone().setAttribute('POSITION', p2);
+    const name = 'PORTA:' + node.getName();
+    const door = doc.createNode(name).setTranslation(c)
+      .setMesh(doc.createMesh(name).addPrimitive(leaf))
+      .setExtras({ porta: true, asse: updir, larghezza: wdir, meta: (w1 - w0) / 2 });
+    node.addChild(door);
+    doorNodes.add(door);
+    mesh.removePrimitive(prim);
+    doors++;
+  }
+  if (!mesh.listPrimitives().length) { node.setMesh(null); mesh.dispose(); }
+}
+// solo le porte tengono il nome: tutto il resto puo' essere unito per alleggerire il modello
+for (const n of doc.getRoot().listNodes()) if (!doorNodes.has(n)) { n.setName(''); if (n.getMesh()) n.getMesh().setName(''); }
+console.log('\nPorte apribili trovate: ' + doors + (doors ? '' : '  (controlla PORTE in converti-modello.bat)'));
+
+{
   const d = Math.PI / 180;
   const q = (ax, a) => { const h = a * d / 2, s = Math.sin(h); return [ax[0]*s, ax[1]*s, ax[2]*s, Math.cos(h)]; };
   const mul = (a, b) => [
@@ -77,21 +127,24 @@ if (rot.some(v => v !== 0)) {
     a[3]*b[2] + a[0]*b[1] - a[1]*b[0] + a[2]*b[3],
     a[3]*b[3] - a[0]*b[0] - a[1]*b[1] - a[2]*b[2]];
   const quat = mul(mul(q([1,0,0], rot[0]), q([0,1,0], rot[1])), q([0,0,1], rot[2]));
-  for (const scene of doc.getRoot().listScenes()) {
-    const root = doc.createNode('RotazioneModello').setRotation(quat);
-    for (const c of scene.listChildren()) { scene.removeChild(c); root.addChild(c); }
-    scene.addChild(root);
+  if (rot.some(v => v !== 0)) {
+    console.log('Applico la rotazione X/Y/Z = ' + rot.join(' / ') + ' gradi...');
+    for (const scene of doc.getRoot().listScenes()) {
+      const root = doc.createNode('').setRotation(quat);
+      for (const c of scene.listChildren()) { scene.removeChild(c); root.addChild(c); }
+      scene.addChild(root);
+    }
   }
-  toRotate = path.join(dir, base + '__rot.glb');
-  await io.write(toRotate, doc);
-  source = toRotate;
 }
+const toRotate = path.join(dir, base + '__rot.glb');
+await io.write(toRotate, doc);
+source = toRotate;
 
-// 3) ottimizzazione per il Quest
+// 3) ottimizzazione per il Quest (--join-named false: le porte restano oggetti separati)
 console.log('\nOttimizzo per il Quest...');
 run(process.execPath, [path.join(here, 'node_modules', '@gltf-transform', 'cli', 'bin', 'cli.js'),
   'optimize', source, out,
-  '--compress', 'draco', '--instance', 'false', '--sparse', 'false',
+  '--compress', 'draco', '--instance', 'false', '--sparse', 'false', '--join-named', 'false',
   '--palette', 'false', '--simplify', 'false', '--texture-size', texSize]);
 
 if (existsSync(tmp)) unlinkSync(tmp);
