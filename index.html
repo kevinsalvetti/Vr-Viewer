@@ -4452,11 +4452,17 @@ function teleport(p){
 
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
-  const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
-  line.scale.z = 5; line.visible = false; c.add(line); c.userData.line = line;
-  c.addEventListener('selectstart', () => { aim.c = c; aim.t = 0; line.visible = true; });
+  const ctrlLine = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
+  ctrlLine.scale.z = 5; ctrlLine.visible = false; c.add(ctrlLine); c.userData.line = ctrlLine;
+  const handRay = makeHandRay(); c.add(handRay); c.userData.handRay = handRay;
+  c.addEventListener('connected', e => {
+    c.userData.isHand = !!(e.data && e.data.hand);
+    ctrlLine.visible = handRay.visible = false;
+    c.userData.line = c.userData.isHand ? handRay : ctrlLine;
+  });
+  c.addEventListener('selectstart', () => { aim.c = c; aim.t = 0; c.userData.line.visible = true; });
   c.addEventListener('selectend', () => {
-    line.visible = false;
+    c.userData.line.visible = false;
     if (aim.c === c) {
       if (aim.ok && aim.hit) teleport(aim.hit);
       aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false;
@@ -4489,16 +4495,154 @@ function updateAim(t){
 }
 
 // ---- Hand tracking (mani nude) ----
+// Aspetto stile Quest: mano traslucida chiara con bordo luminoso (effetto fresnel),
+// polpastrelli che si illuminano mentre fai la pinza, raggio di puntamento sfumato.
+const FINGERS = [
+  ['wrist','thumb-metacarpal','thumb-phalanx-proximal','thumb-phalanx-distal','thumb-tip'],
+  ...['index-finger','middle-finger','ring-finger','pinky-finger'].map(f =>
+    ['wrist', f+'-metacarpal', f+'-phalanx-proximal', f+'-phalanx-intermediate', f+'-phalanx-distal', f+'-tip'])
+];
+const BONES = [];
+FINGERS.forEach(ch => { for (let k = 1; k < ch.length; k++) BONES.push([ch[k-1], ch[k]]); });
+// riempimento del palmo: bordi tra le nocche e tra i metacarpi
+[['index-finger-phalanx-proximal','middle-finger-phalanx-proximal'],
+ ['middle-finger-phalanx-proximal','ring-finger-phalanx-proximal'],
+ ['ring-finger-phalanx-proximal','pinky-finger-phalanx-proximal'],
+ ['thumb-phalanx-proximal','index-finger-phalanx-proximal'],
+ ['index-finger-metacarpal','pinky-finger-metacarpal']].forEach(b => BONES.push(b));
+const JOINT_NAMES = [...new Set(FINGERS.flat())];
+const PALM = ['wrist','thumb-metacarpal','thumb-phalanx-proximal','index-finger-phalanx-proximal',
+  'middle-finger-phalanx-proximal','ring-finger-phalanx-proximal','pinky-finger-phalanx-proximal','pinky-finger-metacarpal'];
+
+const HAND_BASE = new THREE.Color(0xe4eaf0);   // bianco-grigio chiaro
+const HAND_PINCH = new THREE.Color(0x7fd8ff);  // azzurro: pinza indice (teletrasporto)
+const HAND_MOVE = new THREE.Color(0xffa64d);   // arancio: pinza medio (movimento)
+
+function makeHandMaterial(){
+  return new THREE.ShaderMaterial({
+    uniforms: { base: { value: HAND_BASE }, wrist: { value: new THREE.Vector3() } },
+    vertexShader: `
+      varying vec3 vN; varying vec3 vV; varying vec3 vLocal; varying vec3 vCol;
+      void main(){
+        vec4 p = vec4(position, 1.0); vec3 n = normal;
+        #ifdef USE_INSTANCING
+          p = instanceMatrix * p; n = mat3(instanceMatrix) * n;
+        #endif
+        #ifdef USE_INSTANCING_COLOR
+          vCol = instanceColor;
+        #else
+          vCol = vec3(-1.0);
+        #endif
+        vLocal = p.xyz;
+        vec4 mv = modelViewMatrix * p;
+        vN = normalize(mat3(modelViewMatrix) * n);
+        vV = normalize(-mv.xyz);
+        gl_Position = projectionMatrix * mv;
+      }`,
+    fragmentShader: `
+      uniform vec3 base; uniform vec3 wrist;
+      varying vec3 vN; varying vec3 vV; varying vec3 vLocal; varying vec3 vCol;
+      void main(){
+        vec3 col = vCol.x < 0.0 ? base : vCol;
+        float hl = clamp(length(col - base) * 1.5, 0.0, 1.0);          // quanto è "acceso"
+        float fres = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 1.6);
+        vec3 c = mix(col, vec3(1.0), fres * 0.9) + col * hl * 0.25;
+        float a = mix(0.3, 0.95, fres) + hl * 0.35;
+        a *= smoothstep(0.0, 0.05, distance(vLocal, wrist)) * 0.8 + 0.2;  // sfuma verso il polso
+        gl_FragColor = vec4(c, clamp(a, 0.0, 1.0));
+      }`,
+    transparent: true, depthWrite: false, depthFunc: THREE.LessEqualDepth, side: THREE.DoubleSide
+  });
+}
+// prima passata solo profondità: così le parti sovrapposte non si sommano (silhouette pulita)
+const handDepthMat = new THREE.MeshBasicMaterial({ colorWrite: false });
+const sphereGeo = new THREE.SphereGeometry(1, 14, 10);
+const cylGeo = new THREE.CylinderGeometry(1, 1, 1, 14, 1, true);
+
+function addPair(parent, makeMesh, mat){
+  const depth = makeMesh(handDepthMat), color = makeMesh(mat);
+  depth.renderOrder = 10; color.renderOrder = 11;
+  depth.frustumCulled = color.frustumCulled = false;
+  parent.add(depth, color);
+  return [depth, color];
+}
+
+function buildHandVisual(hand){
+  const mat = makeHandMaterial();
+  const spheres = addPair(hand, m => new THREE.InstancedMesh(sphereGeo, m, JOINT_NAMES.length), mat);
+  const cyls = addPair(hand, m => new THREE.InstancedMesh(cylGeo, m, BONES.length), mat);
+  const palmGeo = new THREE.BufferGeometry();
+  palmGeo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(PALM.length * 3), 3));
+  const idx = []; for (let k = 1; k < PALM.length - 1; k++) idx.push(0, k, k + 1);
+  palmGeo.setIndex(idx);
+  addPair(hand, m => new THREE.Mesh(palmGeo, m), mat);
+  for (const [, m] of [spheres, cyls]) for (let k = 0; k < m.count; k++) m.setColorAt(k, HAND_BASE);
+  return { mat, spheres, cyls, palmGeo };
+}
+
+const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _s = new THREE.Vector3(),
+      _p = new THREE.Vector3(), _d = new THREE.Vector3(), _Y = new THREE.Vector3(0, 1, 0), _c = new THREE.Color();
+const jr = j => Math.max(j.jointRadius || 0.008, 0.005);
+
+function tintFor(name, st){
+  const isTip = name === 'thumb-tip' || name === 'thumb-phalanx-distal';
+  if (st.pinching && (isTip || name === 'middle-finger-tip' || name === 'middle-finger-phalanx-distal')) return HAND_MOVE;
+  if (st.pinchStrength > 0 && (isTip || name === 'index-finger-tip' || name === 'index-finger-phalanx-distal'))
+    return _c.copy(HAND_BASE).lerp(HAND_PINCH, st.pinchStrength);
+  return HAND_BASE;
+}
+
+function updateHandVisual(st){
+  const J = st.hand.joints, v = st.vis;
+  if (!v || !J['wrist']) return;
+  v.mat.uniforms.wrist.value.copy(J['wrist'].position);
+  JOINT_NAMES.forEach((n, k) => {
+    const j = J[n]; if (!j) return;
+    const r = n === 'wrist' ? 0.001 : jr(j);
+    _m.compose(j.position, _q.identity(), _s.setScalar(r));
+    for (const m of v.spheres) m.setMatrixAt(k, _m);
+    v.spheres[1].setColorAt(k, tintFor(n, st));
+  });
+  BONES.forEach(([a, b], k) => {
+    const ja = J[a], jb = J[b]; if (!ja || !jb) return;
+    _d.subVectors(jb.position, ja.position);
+    const len = _d.length();
+    const r = a === 'wrist' ? jr(jb) : Math.min(jr(ja), jr(jb));
+    _p.addVectors(ja.position, jb.position).multiplyScalar(0.5);
+    _q.setFromUnitVectors(_Y, _d.divideScalar(len || 1));
+    _m.compose(_p, _q, _s.set(r, len, r));
+    for (const m of v.cyls) m.setMatrixAt(k, _m);
+    v.cyls[1].setColorAt(k, tintFor(b, st));
+  });
+  for (const m of [...v.spheres, ...v.cyls]) m.instanceMatrix.needsUpdate = true;
+  v.spheres[1].instanceColor.needsUpdate = v.cyls[1].instanceColor.needsUpdate = true;
+  const pa = v.palmGeo.attributes.position;
+  PALM.forEach((n, k) => { const j = J[n]; if (j) pa.setXYZ(k, j.position.x, j.position.y, j.position.z); });
+  pa.needsUpdate = true; v.palmGeo.computeVertexNormals();
+}
+
+// raggio di puntamento sfumato (al posto della linea bianca) quando usi le mani
+function makeHandRay(){
+  const g = new THREE.CylinderGeometry(0.0015, 0.004, 1, 10, 1, true).rotateX(-Math.PI / 2).translate(0, 0, -0.5);
+  const mat = new THREE.ShaderMaterial({
+    uniforms: { color: { value: new THREE.Color(0xffffff) }, opacity: { value: 0.3 } },
+    vertexShader: 'varying float t; void main(){ t = -position.z; gl_Position = projectionMatrix * modelViewMatrix * vec4(position,1.0); }',
+    fragmentShader: 'uniform vec3 color; uniform float opacity; varying float t; void main(){ gl_FragColor = vec4(color, opacity * smoothstep(0.0,0.08,t) * (1.0 - t*0.85)); }',
+    transparent: true, depthWrite: false
+  });
+  mat.color = mat.uniforms.color.value;   // così updateAim può fare line.material.color.set(...)
+  const ray = new THREE.Mesh(g, mat);
+  ray.renderOrder = 12; ray.visible = false;
+  return ray;
+}
+
 const handStates = [];
-const jointGeo = new THREE.SphereGeometry(1, 8, 8);
-const jointMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
-const jointActiveMat = new THREE.MeshBasicMaterial({ color: 0xff9900 });
 for (let i = 0; i < 2; i++) {
   const hand = renderer.xr.getHand(i);
   rig.add(hand);
-  const st = { hand, handed: null, pinching: false, anchor: new THREE.Vector3() };
+  const st = { hand, handed: null, pinching: false, pinchStrength: 0, anchor: new THREE.Vector3(), vis: buildHandVisual(hand) };
   hand.addEventListener('connected', e => { st.handed = (e.data && e.data.hand) ? e.data.handedness : null; });
-  hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = false; });
+  hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = false; st.pinchStrength = 0; });
   handStates.push(st);
 }
 const hf = new THREE.Vector3(), hr = new THREE.Vector3(), hd3 = new THREE.Vector3();
@@ -4510,18 +4654,16 @@ function handsLoop(dt){
   hf.y = 0; hf.normalize(); hr.crossVectors(hf, up).normalize();
   for (const st of handStates) {
     const hand = st.hand, J = hand.joints;
-    if (!st.handed || !hand.visible) { st.pinching = false; continue; }
-    for (const name in J) {                       // piccole sfere sulle articolazioni
-      const j = J[name];
-      if (!j.userData.vis) { const m = new THREE.Mesh(jointGeo, jointMat); j.add(m); j.userData.vis = m; }
-      j.userData.vis.scale.setScalar(Math.max(j.jointRadius || 0.008, 0.006));
-    }
-    const mid = J['middle-finger-tip'], thumb = J['thumb-tip'];
-    if (!mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; continue; }
+    if (!st.handed || !hand.visible) { st.pinching = false; st.pinchStrength = 0; continue; }
+    const mid = J['middle-finger-tip'], thumb = J['thumb-tip'], index = J['index-finger-tip'];
+    // quanto sono vicini indice e pollice (0 = aperti, 1 = pinza chiusa): illumina i polpastrelli e il raggio
+    st.pinchStrength = (index && thumb) ?
+      Math.min(Math.max((0.06 - index.position.distanceTo(thumb.position)) / 0.04, 0), 1) : 0;
+    if (!mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; updateHandVisual(st); continue; }
     const dist = mid.position.distanceTo(thumb.position);
     if (!st.pinching && dist < 0.025) { st.pinching = true; st.anchor.copy(mid.position); }
     else if (st.pinching && dist > 0.04) st.pinching = false;
-    mid.userData.vis.material = st.pinching ? jointActiveMat : jointMat;
+    updateHandVisual(st);
     if (!st.pinching) continue;
     // spostamento della mano rispetto a dove è iniziata la pinza, nel sistema "testa"
     hd3.copy(mid.position).sub(st.anchor).applyAxisAngle(up, rig.rotation.y);
@@ -4536,11 +4678,23 @@ function handsLoop(dt){
   }
 }
 
+// raggio delle mani: corto e tenue a riposo, più luminoso mentre chiudi la pinza (come sul Quest)
+function updateHandRays(){
+  for (let i = 0; i < 2; i++) {
+    const c = renderer.xr.getController(i), ray = c.userData.handRay;
+    if (!ray || !c.userData.isHand) continue;
+    const s = handStates[i].pinchStrength;
+    ray.material.uniforms.opacity.value = 0.25 + 0.6 * s;
+    if (aim.c === c) continue;                      // durante il teletrasporto lo gestisce updateAim
+    ray.visible = true; ray.scale.z = 0.6; ray.material.color.set(0xffffff);
+  }
+}
+
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
   try { locomotion(dt); updateAim(t); } catch (e) {}
-  try { handsLoop(dt); } catch (e) {}
+  try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
   renderer.render(scene, camera);
 });
 
