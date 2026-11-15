@@ -36,7 +36,7 @@
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
-  </div>
+  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi</div>
 </div>
 
 <script>
@@ -4277,7 +4277,7 @@ const VRButton = { createButton(renderer){
       if (session) { session.end(); return; }
       b.textContent = 'Avvio VR...';
       const attempts = [
-        ['immersive-vr', {optionalFeatures:['local-floor']}],
+        ['immersive-vr', {optionalFeatures:['local-floor','hand-tracking']}],
         ['immersive-vr', {}],
         ['immersive-ar', {optionalFeatures:['local-floor']}]
       ];
@@ -4488,10 +4488,59 @@ function updateAim(t){
   }
 }
 
+// ---- Hand tracking (mani nude) ----
+const handStates = [];
+const jointGeo = new THREE.SphereGeometry(1, 8, 8);
+const jointMat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+const jointActiveMat = new THREE.MeshBasicMaterial({ color: 0xff9900 });
+for (let i = 0; i < 2; i++) {
+  const hand = renderer.xr.getHand(i);
+  rig.add(hand);
+  const st = { hand, handed: null, pinching: false, anchor: new THREE.Vector3() };
+  hand.addEventListener('connected', e => { st.handed = (e.data && e.data.hand) ? e.data.handedness : null; });
+  hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = false; });
+  handStates.push(st);
+}
+const hf = new THREE.Vector3(), hr = new THREE.Vector3(), hd3 = new THREE.Vector3();
+const hz = v => Math.sign(v) * Math.min(Math.max((Math.abs(v) - 0.03) / 0.12, 0), 1);   // zona morta 3 cm, massimo a 15 cm
+
+function handsLoop(dt){
+  if (!renderer.xr.isPresenting) return;
+  renderer.xr.getCamera(camera).getWorldDirection(hf);
+  hf.y = 0; hf.normalize(); hr.crossVectors(hf, up).normalize();
+  for (const st of handStates) {
+    const hand = st.hand, J = hand.joints;
+    if (!st.handed || !hand.visible) { st.pinching = false; continue; }
+    for (const name in J) {                       // piccole sfere sulle articolazioni
+      const j = J[name];
+      if (!j.userData.vis) { const m = new THREE.Mesh(jointGeo, jointMat); j.add(m); j.userData.vis = m; }
+      j.userData.vis.scale.setScalar(Math.max(j.jointRadius || 0.008, 0.006));
+    }
+    const mid = J['middle-finger-tip'], thumb = J['thumb-tip'];
+    if (!mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; continue; }
+    const dist = mid.position.distanceTo(thumb.position);
+    if (!st.pinching && dist < 0.025) { st.pinching = true; st.anchor.copy(mid.position); }
+    else if (st.pinching && dist > 0.04) st.pinching = false;
+    mid.userData.vis.material = st.pinching ? jointActiveMat : jointMat;
+    if (!st.pinching) continue;
+    // spostamento della mano rispetto a dove è iniziata la pinza, nel sistema "testa"
+    hd3.copy(mid.position).sub(st.anchor).applyAxisAngle(up, rig.rotation.y);
+    const fz = hz(hd3.dot(hf)), fx = hz(hd3.dot(hr)), fy = hz(hd3.y);
+    if (st.handed === 'left') {
+      rig.position.addScaledVector(hf, fz * 2 * dt);
+      rig.position.addScaledVector(hr, fx * 2 * dt);
+    } else {
+      rotateAboutHead(-fx * (parseFloat(turnSpeedEl.value) || 90) * Math.PI / 180 * dt);
+      rig.position.y += fy * 1.5 * dt;
+    }
+  }
+}
+
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
   try { locomotion(dt); updateAim(t); } catch (e) {}
+  try { handsLoop(dt); } catch (e) {}
   renderer.render(scene, camera);
 });
 
