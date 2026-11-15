@@ -37,7 +37,7 @@
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
   <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi
-  <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · tieni premuto 1 secondo = cardine sull'altro lato</div>
+  <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata)</div>
 </div>
 
 <script>
@@ -4447,7 +4447,8 @@ const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), n
 
 // ---- Porte apribili (create dal convertitore: nodi "PORTA:..." con asse e larghezza dell'anta) ----
 // Punta una porta e premi grilletto / fai la pinza = apri o chiudi (si apre sempre allontanandosi da te).
-// Tieni premuto almeno 0,7 s = sposta il cardine sull'altro lato (viene ricordato per quel modello).
+// Ogni porta si apre sempre nello stesso verso. Tieni premuto almeno 0,7 s = passa alla combinazione
+// successiva di cardine (destra/sinistra) e verso (dentro/fuori); viene ricordata per quel modello.
 const doors = [];
 const LONG_PRESS = 700;
 let doorPress = null;
@@ -4456,7 +4457,7 @@ const doorKey = () => 'vrviewer-porte:' + ((model && model.userData.fileName) ||
 function loadDoorSides(){ try { return JSON.parse(localStorage.getItem(doorKey())) || {}; } catch (e) { return {}; } }
 function saveDoorSides(){
   try {
-    const o = {}; doors.forEach(d => { if (d.side !== 1) o[d.obj.name] = d.side; });
+    const o = {}; doors.forEach(d => { if (d.side !== 1 || d.swing !== 1) o[d.obj.name] = [d.side, d.swing]; });
     localStorage.setItem(doorKey(), JSON.stringify(o));
   } catch (e) {}
 }
@@ -4470,7 +4471,9 @@ function setupDoors(){
     doors.push({ obj: o, M0: o.matrix.clone(),
       axis: new THREE.Vector3().fromArray(u.asse).normalize(),
       w: new THREE.Vector3().fromArray(u.larghezza).normalize(),
-      half: u.meta || 0.4, side: sides[o.name] === -1 ? -1 : 1, angle: 0, target: 0 });
+      half: u.meta || 0.4, angle: 0, target: 0,
+      side: [].concat(sides[o.name] || 1)[0] === -1 ? -1 : 1,
+      swing: [].concat(sides[o.name] || 1)[1] === -1 ? -1 : 1 });
   });
 }
 function applyDoor(d){
@@ -4481,16 +4484,14 @@ function applyDoor(d){
     .multiply(_T.makeTranslation(-_h.x, -_h.y, -_h.z))
     .decompose(d.obj.position, d.obj.quaternion, d.obj.scale);
 }
-function toggleDoor(d, flip){
-  if (flip) { d.side = -d.side; d.angle = 0; applyDoor(d); saveDoorSides(); }
-  else if (d.target !== 0) { d.target = 0; return; }
-  // da che parte sei rispetto alla porta chiusa? la porta si apre dalla parte opposta
-  const head = new THREE.Vector3().setFromMatrixPosition(
-    (renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera).matrixWorld);
-  d.obj.parent.updateMatrixWorld(true);
-  head.applyMatrix4(new THREE.Matrix4().multiplyMatrices(d.obj.parent.matrixWorld, d.M0).invert());
-  const n = new THREE.Vector3().crossVectors(d.axis, d.w);
-  d.target = d.side * (head.dot(n) >= 0 ? 1 : -1) * Math.PI / 2;
+function toggleDoor(d, change){
+  if (change) {
+    // prossima delle 4 combinazioni: verso opposto, poi cardine sull'altro lato (verso 1 e 2)
+    if (d.swing === 1) d.swing = -1; else { d.swing = 1; d.side = -d.side; }
+    d.angle = 0; applyDoor(d); saveDoorSides();
+  } else if (d.target !== 0) { d.target = 0; return; }
+  // ogni porta si apre sempre nello stesso verso, di 90 gradi
+  d.target = d.side * d.swing * Math.PI / 2;
 }
 function updateDoors(dt){
   for (const d of doors) {
@@ -4500,7 +4501,7 @@ function updateDoors(dt){
     applyDoor(d);
   }
   if (doorPress && performance.now() - doorPress.t0 >= LONG_PRESS)
-    doorPress.c.userData.line.material.color.set(0xff8a00);   // arancio: al rilascio cambia lato del cardine
+    doorPress.c.userData.line.material.color.set(0xff8a00);   // arancio: al rilascio cambia cardine / verso
 }
 function doorOf(o){
   for (; o && o !== model; o = o.parent) if (o.userData.porta) return doors.find(d => d.obj === o) || null;
@@ -4583,7 +4584,7 @@ function updateAim(t){
 }
 
 // ---- Hand tracking (mani nude) ----
-// Aspetto stile Quest: mano traslucida chiara con bordo luminoso (effetto fresnel),
+// Aspetto: guanto nero opaco in tessuto (ombreggiatura morbida, riflesso leggero sui bordi),
 // polpastrelli che si illuminano mentre fai la pinza, raggio di puntamento sfumato.
 const FINGERS = [
   ['wrist','thumb-metacarpal','thumb-phalanx-proximal','thumb-phalanx-distal','thumb-tip'],
@@ -4602,7 +4603,7 @@ const JOINT_NAMES = [...new Set(FINGERS.flat())];
 const PALM = ['wrist','thumb-metacarpal','thumb-phalanx-proximal','index-finger-phalanx-proximal',
   'middle-finger-phalanx-proximal','ring-finger-phalanx-proximal','pinky-finger-phalanx-proximal','pinky-finger-metacarpal'];
 
-const HAND_BASE = new THREE.Color(0xe4eaf0);   // bianco-grigio chiaro
+const HAND_BASE = new THREE.Color(0xa9adb3);   // grigio chiaro, come un guanto
 const HAND_PINCH = new THREE.Color(0x7fd8ff);  // azzurro: pinza indice (teletrasporto)
 const HAND_MOVE = new THREE.Color(0xffa64d);   // arancio: pinza medio (movimento)
 
@@ -4631,15 +4632,15 @@ function makeHandMaterial(){
       uniform vec3 base; uniform vec3 wrist;
       varying vec3 vN; varying vec3 vV; varying vec3 vLocal; varying vec3 vCol;
       void main(){
+        // guanto in tessuto nero opaco: luce morbida dall'alto + leggero riflesso sui bordi
         vec3 col = vCol.x < 0.0 ? base : vCol;
-        float hl = clamp(length(col - base) * 1.5, 0.0, 1.0);          // quanto è "acceso"
-        float fres = pow(1.0 - abs(dot(normalize(vN), normalize(vV))), 1.6);
-        vec3 c = mix(col, vec3(1.0), fres * 0.9) + col * hl * 0.25;
-        float a = mix(0.3, 0.95, fres) + hl * 0.35;
-        a *= smoothstep(0.0, 0.05, distance(vLocal, wrist)) * 0.8 + 0.2;  // sfuma verso il polso
-        gl_FragColor = vec4(c, clamp(a, 0.0, 1.0));
+        vec3 n = normalize(vN); if (!gl_FrontFacing) n = -n;
+        float diff = dot(n, normalize(vec3(0.3, 0.8, 0.6))) * 0.5 + 0.5;    // luce "avvolgente", niente nero pieno
+        float fres = pow(1.0 - abs(dot(n, normalize(vV))), 3.0);
+        vec3 c = col * (0.78 + 0.32 * diff) - vec3(0.06) * fres;   // ombre leggere: nasconde le giunture tra i pezzi
+        gl_FragColor = vec4(c, 1.0);
       }`,
-    transparent: true, depthWrite: false, depthFunc: THREE.LessEqualDepth, side: THREE.DoubleSide
+    depthFunc: THREE.LessEqualDepth, side: THREE.DoubleSide
   });
 }
 // prima passata solo profondità: così le parti sovrapposte non si sommano (silhouette pulita)
@@ -4670,7 +4671,8 @@ function buildHandVisual(hand){
 
 const _m = new THREE.Matrix4(), _q = new THREE.Quaternion(), _s = new THREE.Vector3(),
       _p = new THREE.Vector3(), _d = new THREE.Vector3(), _Y = new THREE.Vector3(0, 1, 0), _c = new THREE.Color();
-const jr = j => Math.max(j.jointRadius || 0.008, 0.005);
+const FINGER_THICK = 1.2;   // dita più "piene", come un guanto (1 = spessore reale delle articolazioni)
+const jr = j => Math.max((j.jointRadius || 0.008) * FINGER_THICK, 0.007);
 
 function tintFor(name, st){
   const isTip = name === 'thumb-tip' || name === 'thumb-phalanx-distal';
@@ -4686,7 +4688,8 @@ function updateHandVisual(st){
   v.mat.uniforms.wrist.value.copy(J['wrist'].position);
   JOINT_NAMES.forEach((n, k) => {
     const j = J[n]; if (!j) return;
-    const r = n === 'wrist' ? 0.001 : jr(j);
+    const r = n === 'wrist' ? 0.019 : n === 'thumb-metacarpal' ? 0.018 :
+              (n.endsWith('-metacarpal') && !n.startsWith('thumb')) ? 0.018 : jr(j);
     _m.compose(j.position, _q.identity(), _s.setScalar(r));
     for (const m of v.spheres) m.setMatrixAt(k, _m);
     v.spheres[1].setColorAt(k, tintFor(n, st));
@@ -4695,7 +4698,11 @@ function updateHandVisual(st){
     const ja = J[a], jb = J[b]; if (!ja || !jb) return;
     _d.subVectors(jb.position, ja.position);
     const len = _d.length();
-    const r = a === 'wrist' ? jr(jb) : Math.min(jr(ja), jr(jb));
+    // ossa del palmo più spesse, così il palmo risulta pieno come un guanto
+    const palm = !a.startsWith('thumb') && (a === 'wrist' || a.endsWith('-metacarpal')) && !b.startsWith('thumb');
+    const knuckles = a.endsWith('-proximal') && b.endsWith('-proximal');
+    const r = palm ? 0.018 : knuckles ? 0.015 : a === 'wrist' ? 0.018 :            // base del pollice bella piena
+              a === 'thumb-metacarpal' ? 0.015 : (jr(ja) + jr(jb)) / 2;
     _p.addVectors(ja.position, jb.position).multiplyScalar(0.5);
     _q.setFromUnitVectors(_Y, _d.divideScalar(len || 1));
     _m.compose(_p, _q, _s.set(r, len, r));
