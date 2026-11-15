@@ -25,10 +25,14 @@
   <input type="number" id="scale" value="1" step="0.001">
   <label>Altezza occhi (m)</label>
   <input type="number" id="eye" value="1.6" step="0.1">
+  <label>Rotazione modello in gradi (X / Y / Z) &mdash; se è sdraiato prova X = -90</label>
+  <input type="number" id="rx" value="0" step="90" style="width:70px">
+  <input type="number" id="ry" value="0" step="90" style="width:70px">
+  <input type="number" id="rz" value="0" step="90" style="width:70px">
   <div id="status">Nessun modello caricato.</div>
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
-    VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grilletto = velocità x3
+    VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
   </div>
 </div>
 
@@ -4352,6 +4356,11 @@ function place(){
   if (!model) return;
   const s = parseFloat(scaleIn.value) || 1;
   model.scale.setScalar(s);
+  const d = Math.PI / 180;
+  model.rotation.set(
+    (parseFloat(document.getElementById('rx').value) || 0) * d,
+    (parseFloat(document.getElementById('ry').value) || 0) * d,
+    (parseFloat(document.getElementById('rz').value) || 0) * d);
   model.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(model);
   const c = box.getCenter(new THREE.Vector3());
@@ -4362,6 +4371,7 @@ function place(){
 file.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
 scaleIn.addEventListener('change', place);
 eyeIn.addEventListener('change', place);
+['rx','ry','rz'].forEach(id => document.getElementById(id).addEventListener('change', place));
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
 
@@ -4382,7 +4392,7 @@ function locomotion(dt){
     const gp = src.gamepad;
     if (!gp || gp.axes.length < 4) continue;
     const x = gp.axes[2], y = gp.axes[3];
-    const boost = (gp.buttons[0] && gp.buttons[0].pressed) ? 3 : 1;
+    const boost = (gp.buttons[1] && gp.buttons[1].pressed) ? 3 : 1;
     if (src.handedness === 'left') {
       if (Math.abs(x) > dead) rig.position.addScaledVector(right, x * 2 * boost * dt);
       if (Math.abs(y) > dead) rig.position.addScaledVector(fwd, -y * 2 * boost * dt);
@@ -4398,10 +4408,72 @@ function locomotion(dt){
   }
 }
 
+// ---- Teletrasporto (tieni premuto il grilletto, punta, rilascia) ----
+let floorMode = true;   // true = lo 0 del visore è il pavimento reale
+renderer.xr.addEventListener('sessionstart', () => {
+  const s = renderer.xr.getSession();
+  floorMode = !s.enabledFeatures || s.enabledFeatures.includes('local-floor');
+  if (model) { place(); if (floorMode) rig.position.y -= (parseFloat(eyeIn.value) || 1.6); }
+});
+
+const ray = new THREE.Raycaster(); ray.far = 40;
+const marker = new THREE.Mesh(
+  new THREE.RingGeometry(0.15, 0.25, 32).rotateX(-Math.PI / 2),
+  new THREE.MeshBasicMaterial({ color: 0x22cc66, side: THREE.DoubleSide, depthTest: false }));
+marker.visible = false; marker.renderOrder = 999; scene.add(marker);
+const aim = { c: null, hit: null, ok: false, t: 0 };
+const lineGeo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3(0, 0, -1)]);
+
+function teleport(p){
+  const xrCam = renderer.xr.getCamera(camera);
+  const head = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+  rig.position.x += p.x - head.x;
+  rig.position.z += p.z - head.z;
+  rig.position.y = p.y + (floorMode ? 0 : (parseFloat(eyeIn.value) || 1.6));
+}
+
+for (let i = 0; i < 2; i++) {
+  const c = renderer.xr.getController(i);
+  const line = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
+  line.scale.z = 5; line.visible = false; c.add(line); c.userData.line = line;
+  c.addEventListener('selectstart', () => { aim.c = c; aim.t = 0; line.visible = true; });
+  c.addEventListener('selectend', () => {
+    line.visible = false;
+    if (aim.c === c) {
+      if (aim.ok && aim.hit) teleport(aim.hit);
+      aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false;
+    }
+  });
+  rig.add(c);
+}
+
+function updateAim(t){
+  if (!aim.c || !model || t - aim.t < 120) return;   // controllo ogni 120 ms per non appesantire
+  aim.t = t;
+  const c = aim.c; c.updateMatrixWorld(true);
+  const o = new THREE.Vector3().setFromMatrixPosition(c.matrixWorld);
+  const d = new THREE.Vector3(0, 0, -1).transformDirection(c.matrixWorld);
+  ray.set(o, d);
+  const hits = ray.intersectObject(model, true);
+  const line = c.userData.line;
+  if (hits.length) {
+    const h = hits[0];
+    const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
+    aim.ok = d.y < -0.05 && Math.abs(n.y) > 0.7;    // solo superfici orizzontali (pavimenti)
+    aim.hit = h.point.clone();
+    marker.position.copy(h.point); marker.position.y += 0.02; marker.visible = true;
+    marker.material.color.set(aim.ok ? 0x22cc66 : 0xcc3322);
+    line.scale.z = h.distance;
+    line.material.color.set(aim.ok ? 0x66ff99 : 0xff6655);
+  } else {
+    aim.ok = false; aim.hit = null; marker.visible = false; line.scale.z = 5;
+  }
+}
+
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
-  try { locomotion(dt); } catch (e) {}
+  try { locomotion(dt); updateAim(t); } catch (e) {}
   renderer.render(scene, camera);
 });
 
