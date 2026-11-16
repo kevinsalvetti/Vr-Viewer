@@ -4546,13 +4546,13 @@ for (let i = 0; i < 2; i++) {
     const p = pickDoor(c);
     if (p) {                                        // puntando una porta: apri/chiudi invece del teletrasporto
       doorPress = { c, door: p.door, t0: performance.now() };
-      line.visible = true; line.scale.z = p.dist; line.material.color.set(0xffd34d);
+      line.visible = true; line.quaternion.identity(); line.scale.z = p.dist; line.material.color.set(0xffd34d);
       return;
     }
-    aim.c = c; aim.t = 0; line.visible = true; line.material.color.set(0xffffff);
+    aim.c = c; aim.t = 0; aim.fresh = true; line.visible = true; line.material.color.set(0xffffff);
   });
   c.addEventListener('selectend', () => {
-    c.userData.line.visible = false;
+    c.userData.line.visible = false; c.userData.line.quaternion.identity();
     if (doorPress && doorPress.c === c) {
       toggleDoor(doorPress.door, performance.now() - doorPress.t0 >= LONG_PRESS);
       doorPress = null;
@@ -4566,27 +4566,55 @@ for (let i = 0; i < 2; i++) {
   rig.add(c);
 }
 
-function updateAim(t){
-  if (!aim.c || !model || t - aim.t < 120) return;   // controllo ogni 120 ms per non appesantire
-  aim.t = t;
-  const c = aim.c; c.updateMatrixWorld(true);
-  const o = new THREE.Vector3().setFromMatrixPosition(c.matrixWorld);
-  const d = new THREE.Vector3(0, 0, -1).transformDirection(c.matrixWorld);
-  ray.set(o, d);
-  const hits = ray.intersectObject(model, true);
-  const line = c.userData.line;
-  if (hits.length) {
-    const h = hits[0];
-    const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
-    aim.ok = d.y < -0.05 && Math.abs(n.y) > 0.7;    // solo superfici orizzontali (pavimenti)
-    aim.hit = h.point.clone();
-    marker.position.copy(h.point); marker.position.y += 0.02; marker.visible = true;
-    marker.material.color.set(aim.ok ? 0x22cc66 : 0xcc3322);
-    line.scale.z = h.distance;
-    line.material.color.set(aim.ok ? 0x66ff99 : 0xff6655);
-  } else {
-    aim.ok = false; aim.hit = null; marker.visible = false; line.scale.z = 5;
+// Puntatore del teletrasporto fluido:
+//  - la direzione del raggio e' smorzata (filtra il tremolio, soprattutto con le mani)
+//  - il punto colpito si ricalcola ogni fotogramma se il modello e' leggero; se il calcolo
+//    costa troppo, l'intervallo si allunga da solo (massimo 120 ms come prima)
+//  - raggio e cerchio "scivolano" verso il nuovo punto invece di saltare
+const aimO = new THREE.Vector3(), aimRawD = new THREE.Vector3(), aimD = new THREE.Vector3(),
+      aimTarget = new THREE.Vector3(), aimShow = new THREE.Vector3(), aimLocal = new THREE.Vector3(),
+      MINUS_Z = new THREE.Vector3(0, 0, -1);
+aim.interval = 0; aim.fresh = true;
+
+function updateAim(t, dt){
+  if (!aim.c || !model) return;
+  const c = aim.c, line = c.userData.line;
+  c.updateMatrixWorld(true);
+  aimO.setFromMatrixPosition(c.matrixWorld);
+  aimRawD.set(0, 0, -1).transformDirection(c.matrixWorld);
+  if (aim.fresh) aimD.copy(aimRawD);                     // appena premuto: parte dalla direzione vera
+  else aimD.lerp(aimRawD, 1 - Math.exp(-dt * (c.userData.isHand ? 12 : 25))).normalize();
+
+  if (aim.fresh || t - aim.t >= aim.interval) {
+    const t0 = performance.now();
+    ray.set(aimO, aimD);
+    const h = ray.intersectObject(model, true)[0];
+    const cost = performance.now() - t0;
+    aim.interval = Math.min(Math.max(cost * 4 - 4, 0), 120);   // < 1 ms: ogni fotogramma
+    aim.t = t;
+    if (h) {
+      const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
+      aim.ok = aimD.y < -0.05 && Math.abs(n.y) > 0.7;    // solo superfici orizzontali (pavimenti)
+      aim.hit = h.point.clone();
+      aimTarget.copy(h.point);
+      marker.material.color.set(aim.ok ? 0x22cc66 : 0xcc3322);
+      line.material.color.set(aim.ok ? 0x66ff99 : 0xff6655);
+    } else {
+      aim.ok = false; aim.hit = null;
+      aimTarget.copy(aimO).addScaledVector(aimD, 5);
+      line.material.color.set(0xffffff);
+    }
   }
+  // punto mostrato: insegue il punto vero in modo morbido
+  if (aim.fresh) aimShow.copy(aimTarget);
+  else aimShow.lerp(aimTarget, 1 - Math.exp(-dt * 30));
+  aim.fresh = false;
+  marker.visible = !!aim.hit;
+  if (aim.hit) { marker.position.copy(aimShow); marker.position.y += 0.02; }
+  // il raggio (figlio del controller) viene orientato verso il punto mostrato
+  aimLocal.copy(aimShow); c.worldToLocal(aimLocal);
+  const len = aimLocal.length();
+  if (len > 1e-4) { line.quaternion.setFromUnitVectors(MINUS_Z, aimLocal.divideScalar(len)); line.scale.z = len; }
 }
 
 // ---- Hand tracking (mani nude) ----
@@ -4750,7 +4778,7 @@ function syncInputSources(){
     if (want && c.userData.line !== want) {
       if (aim.c === c) { aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false; }
       if (doorPress && doorPress.c === c) doorPress = null;
-      c.userData.line.visible = false; c.userData.line = want;
+      c.userData.line.visible = false; c.userData.line.quaternion.identity(); c.userData.line = want;
     }
   }
 }
@@ -4795,7 +4823,7 @@ function updateHandRays(){
     const s = handStates[i].pinchStrength;
     ray.material.uniforms.opacity.value = 0.25 + 0.6 * s;
     if (aim.c === c || (doorPress && doorPress.c === c)) continue;   // teletrasporto / porta: gestiti altrove
-    ray.visible = true; ray.scale.z = 0.6; ray.material.color.set(0xffffff);
+    ray.visible = true; ray.quaternion.identity(); ray.scale.z = 0.6; ray.material.color.set(0xffffff);
   }
 }
 
@@ -4803,7 +4831,7 @@ let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
   try { syncInputSources(); } catch (e) {}
-  try { locomotion(dt); updateAim(t); updateDoors(dt); } catch (e) {}
+  try { locomotion(dt); updateAim(t, dt); updateDoors(dt); } catch (e) {}
   try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
   renderer.render(scene, camera);
 });
