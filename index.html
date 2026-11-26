@@ -7,14 +7,27 @@
 <style>
   html,body{margin:0;height:100%;background:#111;color:#eee;font-family:system-ui,sans-serif;overflow:hidden}
   #ui{position:fixed;top:12px;left:12px;max-width:340px;background:#000a;padding:14px;border-radius:10px;z-index:5}
-  #ui h1{font-size:16px;margin:0 0 8px}
+  #ui h1{font-size:20px;margin:0 0 12px;text-align:center;letter-spacing:.3px}
+  #ui h2{font-size:15px;margin:14px 0 4px;text-align:center;font-weight:600}
   #ui label{display:block;margin:8px 0 2px;font-size:13px}
   #ui input[type=file]{width:100%;font-size:14px}
   #ui input[type=number]{width:80px}
-  #status{margin-top:8px;font-size:13px;color:#9cf}
+  #status{margin-top:6px;font-size:13px;color:#9cf}
+  #adv{margin-top:12px;border-top:1px solid #fff2;padding-top:8px}
+  #adv summary{cursor:pointer;font-size:13px;user-select:none;opacity:.9}
+  #adv summary:hover{opacity:1}
+  #adv[open] summary{margin-bottom:4px}
   #vrbtn{margin-top:10px}
   .sbtn{padding:6px 10px;font-size:13px;border-radius:6px;border:0;background:#456;color:#fff;cursor:pointer}
   .sbtn:hover{background:#567}
+  #ui label.bigbtn, .bigbtn{display:block;width:100%;box-sizing:border-box;margin:6px 0 0;padding:14px 12px;border:0;border-radius:8px;
+    background:#3b6ea5;color:#fff;font:600 16px system-ui,sans-serif;text-align:center;cursor:pointer}
+  .bigbtn:hover{background:#4a80bb}
+  .midbtn{display:block;width:100%;box-sizing:border-box;padding:9px 12px;border:1px solid #6f8db0;border-radius:8px;
+    background:transparent;color:#dfe8f2;font:500 14px system-ui,sans-serif;text-align:center;cursor:pointer}
+  .midbtn:hover{background:#ffffff12}
+  .orsep{text-align:center;font-size:13px;opacity:.7;margin:5px 0}
+  .bigbtn small{display:block;font-size:12px;font-weight:400;opacity:.8;margin-top:3px}
   #planBar{display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:6;background:#000c;color:#eee;
     padding:10px 14px;border-radius:10px;font-size:13px;max-width:calc(100% - 32px);box-sizing:border-box;text-align:center;line-height:1.6}
   #planBar input{width:60px}
@@ -30,31 +43,30 @@
 </div>
 <div id="ui">
   <h1>Revit VR Viewer</h1>
-  <label>1. Scegli il modello (.glb / .gltf)</label>
-  <input type="file" id="file">
-  <label>2. Scala (1 = metri; 0.3048 se in piedi; 0.001 se in mm)</label>
-  <input type="number" id="scale" value="1" step="0.001">
-  <label>Altezza occhi (m)</label>
-  <input type="number" id="eye" value="1.6" step="0.1">
-  <label>Punto di partenza in VR</label>
-  <button id="spawnPick" class="sbtn">Scegli sulla pianta</button>
-  <button id="spawnClear" class="sbtn">Centro del modello</button>
-  <div id="spawnInfo" style="font-size:12px;opacity:.8;margin-top:3px">Partenza: centro del modello</div>
-  <label>Rotazione modello in gradi (X / Y / Z) &mdash; se è sdraiato prova X = -90</label>
-  <input type="number" id="rx" value="0" step="90" style="width:70px">
-  <input type="number" id="ry" value="0" step="90" style="width:70px">
-  <input type="number" id="rz" value="0" step="90" style="width:70px">
-  <label>Rotazione con lo stick destro</label>
-  <select id="turnMode"><option value="smooth">Fluida</option><option value="snap">A scatti (30°)</option></select>
-  <input type="number" id="turnSpeed" value="90" step="10" min="10" max="360" style="width:70px"> gradi/s (fluida)
-  <label><input type="checkbox" id="coll" checked> Collisioni: non si attraversano i muri (corpo, mani e raggi)</label>
+  <label for="file" class="bigbtn">Scegli il file del modello<small>.glb / .gltf — oppure trascinalo nella pagina</small></label>
+  <input type="file" id="file" accept=".glb,.gltf" style="display:none">
   <div id="status">Nessun modello caricato.</div>
+  <h2>Punto di partenza in VR</h2>
+  <button id="spawnPick" class="bigbtn">Scegli sulla pianta<small>dove parti e dove guardi entrando in VR</small></button>
+  <div class="orsep">o</div>
+  <button id="spawnClear" class="midbtn">Usa il centro del modello</button>
+  <div id="spawnInfo" style="font-size:12px;opacity:.8;margin-top:3px">Partenza: centro del modello</div>
+  <details id="adv">
+    <summary>Impostazioni avanzate</summary>
+    <label>Altezza occhi (m)</label>
+    <input type="number" id="eye" value="1.6" step="0.1">
+    <label>Scala (1 = metri; 0.3048 se in piedi; 0.001 se in mm)</label>
+    <input type="number" id="scale" value="1" step="0.001">
+    <label>Rotazione modello in gradi (X / Y / Z) &mdash; se è sdraiato prova X = -90</label>
+    <input type="number" id="rx" value="0" step="90" style="width:70px">
+    <input type="number" id="ry" value="0" step="90" style="width:70px">
+    <input type="number" id="rz" value="0" step="90" style="width:70px">
+    <label>Rotazione con lo stick destro</label>
+    <select id="turnMode"><option value="smooth">Fluida</option><option value="snap">A scatti (30°)</option></select>
+    <input type="number" id="turnSpeed" value="90" step="10" min="10" max="360" style="width:70px"> gradi/s (fluida)
+    <label><input type="checkbox" id="coll" checked> Collisioni: non si attraversano i muri (corpo, mani e raggi)</label>
+  </details>
   <div id="vrbtn"></div>
-  <div style="font-size:12px;margin-top:10px;opacity:.8">
-    VR: stick sinistro = muoversi · stick destro ←→ = ruota · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
-  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra (o la destra, si sceglie dal menu in VR) e muovi la mano avanti/indietro = cammini avanti/indietro
-  <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · con le mani: palmo sinistro verso il viso + pinza indice+pollice = apri/chiudi · punta un bottone e premi il grilletto (o fai la pinza)
-  <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata) · porte scorrevoli: stesso gesto, l'anta scorre di lato; tieni premuto 1 secondo = scorre dall'altra parte</div>
 </div>
 
 <script>
