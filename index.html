@@ -36,7 +36,7 @@
   <div id="status">Nessun modello caricato.</div>
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
-    VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
+    VR: stick sinistro = muoversi · stick destro ←→ = ruota · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
   <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra (o la destra, si sceglie dal menu in VR) e muovi la mano avanti/indietro = cammini avanti/indietro
   <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · con le mani: palmo sinistro verso il viso + pinza indice+pollice = apri/chiudi · punta un bottone e premi il grilletto (o fai la pinza)
   <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata) · porte scorrevoli: stesso gesto, l'anta scorre di lato; tieni premuto 1 secondo = scorre dall'altra parte</div>
@@ -4496,19 +4496,14 @@ function locomotion(dt){
       if (Math.abs(x) > dead) rig.position.addScaledVector(right, x * 2 * boost * dt);
       if (Math.abs(y) > dead) rig.position.addScaledVector(fwd, -y * 2 * boost * dt);
     } else if (src.handedness === 'right') {
-      if (turnModeEl.value === 'smooth') {
-        if (Math.abs(x) > dead) {
-          const k = (Math.abs(x) - dead) / (1 - dead) * Math.sign(x);   // 0..1 con zona morta
-          const speed = (parseFloat(turnSpeedEl.value) || 90) * Math.PI / 180;
-          rotateAboutHead(-k * speed * dt);
-        }
-      } else if (Math.abs(x) > 0.7) {
+      // levetta destra: sempre rotazione a scatti (30°)
+      if (Math.abs(x) > 0.7) {
         if (snapReady) {
           rotateAboutHead((x > 0 ? -1 : 1) * Math.PI / 6);  // 30°
           snapReady = false;
         }
       } else if (Math.abs(x) < 0.3) snapReady = true;
-      if (Math.abs(y) > dead) rig.position.y += -y * 1.5 * boost * dt;
+      // levetta destra su/giu': nessun effetto (niente piu' salita/discesa dello spettatore)
     }
   }
 }
