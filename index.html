@@ -4906,6 +4906,14 @@ function resolveBody(){
 // la mano non entra nei muri: se un dito andrebbe oltre una superficie, tutta la mano si ferma li'
 const HAND_TIPS = ['wrist', 'thumb-tip', 'index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip'];
 const _hp = new THREE.Vector3(), _hh = new THREE.Vector3(), _ho = new THREE.Vector3(), _hq = new THREE.Quaternion();
+// se il punto p (mondo) e' oltre una superficie vista dalla testa, allunga offset fino a riportarlo
+// 1 cm prima della superficie (si tiene lo spostamento piu' grande tra tutti i punti controllati)
+function pushBack(head, p, offset){
+  if (!segmentHit(head, p, _hh)) return;
+  _ho.subVectors(_hh, p);                                // dal punto alla superficie...
+  _ho.addScaledVector(_sDir.subVectors(p, head).normalize(), -0.01);   // ...e 1 cm prima
+  if (_ho.lengthSq() > offset.lengthSq()) offset.copy(_ho);
+}
 function clampHand(st){
   st.offset = st.offset || new THREE.Vector3();
   st.offset.set(0, 0, 0);
@@ -4913,11 +4921,7 @@ function clampHand(st){
     const head = headW(_headHand);
     for (const n of HAND_TIPS) {
       const j = st.hand.joints[n]; if (!j) continue;
-      j.getWorldPosition(_hp);
-      if (!segmentHit(head, _hp, _hh)) continue;
-      _ho.subVectors(_hh, _hp);                            // dal dito al punto della superficie...
-      _ho.addScaledVector(_sDir.subVectors(_hp, head).normalize(), -0.01);   // ...e 1 cm prima
-      if (_ho.lengthSq() > st.offset.lengthSq()) st.offset.copy(_ho);
+      pushBack(head, j.getWorldPosition(_hp), st.offset);
     }
   }
   if (st.handRoot) {                                     // spostamento in coordinate della mano
@@ -5217,7 +5221,38 @@ const ctrlStates = [];
 for (let i = 0; i < 2; i++) {
   const grip = renderer.xr.getControllerGrip(i);
   rig.add(grip);
-  ctrlStates.push({ grip, handed: null, model: null, parts: [], token: 0 });
+  ctrlStates.push({ grip, handed: null, model: null, parts: [], token: 0, pts: [], offset: new THREE.Vector3() });
+}
+// Punti di controllo per le collisioni: i vertici piu' esterni del modello in 14 direzioni (assi e diagonali),
+// in coordinate della grip. Fanno per il controller quello che le punte delle dita fanno per la mano.
+const CTRL_DIRS = [];
+for (const x of [-1, 0, 1]) for (const y of [-1, 0, 1]) for (const z of [-1, 0, 1])
+  if (Math.abs(x) + Math.abs(y) + Math.abs(z) === 1 || (x && y && z)) CTRL_DIRS.push(new THREE.Vector3(x, y, z).normalize());
+function ctrlExtremes(m){
+  m.updateMatrixWorld(true);                       // m non e' ancora agganciato: matrixWorld = coordinate della grip
+  const best = CTRL_DIRS.map(() => ({ d: -Infinity, p: new THREE.Vector3() })), v = new THREE.Vector3();
+  m.traverse(o => {
+    if (!o.isMesh || !o.geometry || !o.geometry.attributes.position) return;
+    const pos = o.geometry.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+      for (let k = 0; k < CTRL_DIRS.length; k++) { const d = v.dot(CTRL_DIRS[k]); if (d > best[k].d) { best[k].d = d; best[k].p.copy(v); } }
+    }
+  });
+  return best.filter(b => b.d > -Infinity).map(b => b.p);
+}
+// il controller non entra nei muri: se un suo punto andrebbe oltre una superficie, tutto il modello si ferma li'
+// (come le mani; il controller vero continua a muoversi, si sposta solo quello che vedi)
+const _headCtrl = new THREE.Vector3();
+function clampController(cs){
+  cs.offset.set(0, 0, 0);
+  if (collOn() && cs.pts.length) {
+    const head = headW(_headCtrl);
+    cs.grip.updateWorldMatrix(true, false);
+    for (const p of cs.pts) pushBack(head, _hp.copy(p).applyMatrix4(cs.grip.matrixWorld), cs.offset);
+  }
+  cs.grip.getWorldQuaternion(_hq).invert();        // spostamento in coordinate della grip
+  cs.model.position.copy(cs.offset).applyQuaternion(_hq);
 }
 function setCtrlModel(cs, handed){
   if (cs.handed === handed) return;
@@ -5231,6 +5266,7 @@ function setCtrlModel(cs, handed){
     cs.parts = CTRL_PARTS[handed].map(([p, idx, n]) => ({ p, idx,
       v: m.getObjectByName(n + '_pressed_value'), lo: m.getObjectByName(n + '_pressed_min'), hi: m.getObjectByName(n + '_pressed_max') }))
       .filter(r => r.v && r.lo && r.hi);
+    cs.pts = ctrlExtremes(m);
     cs.grip.add(m); cs.model = m;
   }).catch(e => console.error('Modello controller:', e));
 }
@@ -5240,7 +5276,9 @@ function updateControllers(){
     const cs = ctrlStates[i], src = session && session.inputSources[i];
     const isCtrl = !!(src && !src.hand && src.gripSpace);
     setCtrlModel(cs, isCtrl ? (src.handedness === 'left' ? 'left' : 'right') : null);
-    if (!cs.model || !src.gamepad) continue;
+    if (!cs.model) continue;
+    clampController(cs);                            // collisioni: il controller si ferma sulle superfici
+    if (!src.gamepad) continue;
     const gp = src.gamepad;
     for (const r of cs.parts) {
       let t;
