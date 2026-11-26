@@ -5110,11 +5110,15 @@ function rayBlocked(c){
 
 // gesto menu (come sul Quest): mano SINISTRA tracciata con il palmo rivolto verso il viso.
 // In questa posa il pizzico indice+pollice apre/chiude il menu invece di teletrasportare.
+// Stessa posa con la mano DESTRA = gesto Home del Quest: il pizzico viene lasciato al sistema
+// (niente teletrasporto, porte o bottoni del menu).
 // Nelle articolazioni WebXR l'asse -Y punta verso il palmo.
 const _pmW = new THREE.Vector3(), _pmN = new THREE.Vector3(), _pmH = new THREE.Vector3();
-function palmMenuPose(i){
+function palmMenuPose(i){ return palmFacesHead(i, 'left'); }
+function palmHomePose(i){ return palmFacesHead(i, 'right'); }
+function palmFacesHead(i, handed){
   const st = handStates[i];
-  if (!st || st.handed !== 'left' || !st.hand.visible) return false;
+  if (!st || st.handed !== handed || !st.hand.visible) return false;
   const j = st.hand.joints['middle-finger-metacarpal'] || st.hand.joints['wrist'];
   if (!j || !j.visible) return false;
   j.updateWorldMatrix(true, false);
@@ -5139,6 +5143,7 @@ for (let i = 0; i < 2; i++) {
       vrMenu.open ? closeMenu() : openMenu();
       return;
     }
+    if (c.userData.isHand && palmHomePose(i)) return;   // priorita': palmo destro verso il viso = gesto Home del Quest
     if (vrMenu.open) { menuClick(c); return; }      // menu aperto: il grilletto preme i bottoni
     const line = c.userData.line;
     const p = pickDoor(c);
@@ -5529,7 +5534,7 @@ function updateHandRays(){
     const s = handStates[i].pinchStrength;
     ray.material.uniforms.opacity.value = 0.25 + 0.6 * s;
     if (aim.c === c || (doorPress && doorPress.c === c)) continue;   // teletrasporto / porta: gestiti altrove
-    if (palmMenuPose(i)) { ray.visible = false; continue; }          // posa menu: niente raggio, il pizzico apre il menu
+    if (palmMenuPose(i) || palmHomePose(i)) { ray.visible = false; continue; }   // posa menu / Home: niente raggio
     ray.visible = !rayBlocked(c); ray.quaternion.identity(); ray.scale.z = 0.6; ray.material.color.set(0xffffff);
   }
 }
