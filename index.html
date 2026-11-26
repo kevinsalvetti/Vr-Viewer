@@ -37,6 +37,7 @@
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
   <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi
+  <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · punta un bottone e premi il grilletto
   <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata) · porte scorrevoli: stesso gesto, l'anta scorre di lato; tieni premuto 1 secondo = scorre dall'altra parte</div>
 </div>
 
@@ -4564,6 +4565,7 @@ for (let i = 0; i < 2; i++) {
     c.userData.line = c.userData.isHand ? handRay : ctrlLine;
   });
   c.addEventListener('selectstart', () => {
+    if (vrMenu.open) { menuClick(c); return; }      // menu aperto: il grilletto preme i bottoni
     const line = c.userData.line;
     const p = pickDoor(c);
     if (p) {                                        // puntando una porta: apri/chiudi invece del teletrasporto
@@ -4823,7 +4825,7 @@ function handsLoop(dt){
     if (!st.pinching && dist < 0.025) { st.pinching = true; st.anchor.copy(mid.position); }
     else if (st.pinching && dist > 0.04) st.pinching = false;
     updateHandVisual(st);
-    if (!st.pinching) continue;
+    if (!st.pinching || vrMenu.open) continue;                  // menu aperto: non ci si muove
     // spostamento della mano rispetto a dove è iniziata la pinza, nel sistema "testa"
     hd3.copy(mid.position).sub(st.anchor).applyAxisAngle(up, rig.rotation.y);
     const fz = hz(hd3.dot(hf)), fx = hz(hd3.dot(hr)), fy = hz(hd3.y);
@@ -4849,12 +4851,121 @@ function updateHandRays(){
   }
 }
 
+// ---- Menu in VR (tasto menu del controller sinistro, o Y) ----
+// Un pannello compare davanti a te; punta un bottone e premi il grilletto (o fai la pinza indice+pollice).
+//  - "Torna alla VR": chiude il menu
+//  - "Esci dalla VR": termina la sessione e torna alla pagina
+// Mentre il menu e' aperto non ci si muove e non si aprono porte.
+const vrMenu = { open: false, mesh: null, ctx: null, tex: null, hover: -1, prev: new WeakMap(),
+  W: 1024, H: 620, size: [0.62, 0.62 * 620 / 1024],
+  buttons: [ { label: 'Torna alla VR', x: 112, y: 190, w: 800, h: 150, color: '#2a9d6a', act: () => closeMenu() },
+             { label: 'Esci dalla VR', x: 112, y: 380, w: 800, h: 150, color: '#c0453a',
+               act: () => { closeMenu(); const s = renderer.xr.getSession(); if (s) s.end(); } } ] };
+(function buildMenu(){
+  const cv = document.createElement('canvas'); cv.width = vrMenu.W; cv.height = vrMenu.H;
+  vrMenu.ctx = cv.getContext('2d');
+  vrMenu.tex = new THREE.CanvasTexture(cv);
+  const m = new THREE.Mesh(new THREE.PlaneGeometry(vrMenu.size[0], vrMenu.size[1]),
+    new THREE.MeshBasicMaterial({ map: vrMenu.tex, transparent: true, depthTest: false, depthWrite: false }));
+  m.renderOrder = 1000; m.visible = false; scene.add(m);
+  vrMenu.mesh = m;
+  drawMenu();
+})();
+function roundRect(g, x, y, w, h, r){
+  g.beginPath(); g.moveTo(x + r, y); g.arcTo(x + w, y, x + w, y + h, r); g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r); g.arcTo(x, y, x + w, y, r); g.closePath();
+}
+function drawMenu(){
+  const g = vrMenu.ctx, W = vrMenu.W, H = vrMenu.H;
+  g.clearRect(0, 0, W, H);
+  roundRect(g, 4, 4, W - 8, H - 8, 48); g.fillStyle = 'rgba(18,22,28,0.92)'; g.fill();
+  g.lineWidth = 4; g.strokeStyle = 'rgba(255,255,255,0.18)'; g.stroke();
+  g.fillStyle = '#fff'; g.font = 'bold 64px system-ui, sans-serif'; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText('Menu', W / 2, 105);
+  vrMenu.buttons.forEach((b, i) => {
+    const hov = i === vrMenu.hover;
+    roundRect(g, b.x, b.y, b.w, b.h, 36);
+    g.fillStyle = b.color; g.globalAlpha = hov ? 1 : 0.6; g.fill(); g.globalAlpha = 1;
+    if (hov) { g.lineWidth = 8; g.strokeStyle = '#fff'; g.stroke(); }
+    g.fillStyle = '#fff'; g.font = 'bold 60px system-ui, sans-serif';
+    g.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 2);
+  });
+  vrMenu.tex.needsUpdate = true;
+}
+function hideRay(c){
+  const l = c.userData.line; if (!l) return;
+  l.visible = false; l.quaternion.identity(); l.scale.z = c.userData.isHand ? 0.6 : 5; l.material.color.set(0xffffff);
+}
+function openMenu(){
+  if (vrMenu.open) return;
+  for (let i = 0; i < 2; i++) hideRay(renderer.xr.getController(i));
+  aim.c = null; aim.ok = false; aim.hit = null; marker.visible = false; doorPress = null;   // annulla teletrasporto / porta in corso
+  const cam = renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera;
+  if (cam === camera) camera.updateWorldMatrix(true, false);
+  const head = new THREE.Vector3().setFromMatrixPosition(cam.matrixWorld), dir = new THREE.Vector3();
+  cam.getWorldDirection(dir); dir.y = 0;
+  if (dir.lengthSq() < 1e-6) dir.set(0, 0, -1);
+  dir.normalize();
+  vrMenu.mesh.position.copy(head).addScaledVector(dir, 0.9); vrMenu.mesh.position.y -= 0.12;
+  vrMenu.mesh.lookAt(head.x, vrMenu.mesh.position.y, head.z);
+  vrMenu.mesh.visible = vrMenu.open = true;
+  vrMenu.hover = -1; drawMenu();
+}
+function closeMenu(){
+  vrMenu.mesh.visible = vrMenu.open = false;
+  for (let i = 0; i < 2; i++) hideRay(renderer.xr.getController(i));
+}
+// bottone puntato dal controller c (indice o -1) e distanza dal pannello
+const _mo = new THREE.Vector3(), _md = new THREE.Vector3(), menuRay = new THREE.Raycaster();
+function menuPick(c){
+  c.updateMatrixWorld(true);
+  _mo.setFromMatrixPosition(c.matrixWorld); _md.set(0, 0, -1).transformDirection(c.matrixWorld);
+  menuRay.set(_mo, _md);
+  const h = menuRay.intersectObject(vrMenu.mesh)[0];
+  if (!h) return null;
+  const x = h.uv.x * vrMenu.W, y = (1 - h.uv.y) * vrMenu.H;
+  return { dist: h.distance, idx: vrMenu.buttons.findIndex(b => x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) };
+}
+function menuClick(c){
+  const p = menuPick(c);
+  if (p && p.idx >= 0) vrMenu.buttons[p.idx].act();
+}
+// tasto menu: sul Quest il tasto ≡ di solito e' riservato al browser, quindi vale anche Y (sinistro)
+function menuButtonPressed(gp, handed){
+  if (!gp) return false;
+  for (let i = 6; i < gp.buttons.length; i++) if (gp.buttons[i] && gp.buttons[i].pressed) return true;   // ≡ se esposto
+  return handed === 'left' && gp.buttons[5] && gp.buttons[5].pressed;                                     // Y
+}
+function updateMenu(){
+  const session = renderer.xr.getSession();
+  if (session) for (const src of session.inputSources) {
+    if (src.hand) continue;
+    const now = menuButtonPressed(src.gamepad, src.handedness);
+    if (now && !vrMenu.prev.get(src)) vrMenu.open ? closeMenu() : openMenu();   // premi = apri, ripremi = chiudi
+    vrMenu.prev.set(src, now);
+  }
+  if (!vrMenu.open || !session) return;
+  let hover = -1;
+  for (let i = 0; i < 2; i++) {
+    const c = renderer.xr.getController(i), l = c.userData.line;
+    if (!l || !session.inputSources[i]) continue;
+    const p = menuPick(c);
+    l.visible = true; l.quaternion.identity();
+    l.scale.z = p ? p.dist : (c.userData.isHand ? 0.6 : 1.5);
+    l.material.color.set(p && p.idx >= 0 ? 0x66ccff : 0xffffff);
+    if (p && p.idx >= 0) hover = p.idx;
+  }
+  if (hover !== vrMenu.hover) { vrMenu.hover = hover; drawMenu(); }
+}
+renderer.xr.addEventListener('sessionend', () => { if (vrMenu.open) closeMenu(); });
+
 let last = 0;
 renderer.setAnimationLoop(t => {
   const dt = Math.min((t - last) / 1000, 0.1); last = t;
   try { syncInputSources(); } catch (e) {}
-  try { locomotion(dt); updateAim(t, dt); updateDoors(dt); } catch (e) {}
+  try { if (!vrMenu.open) { locomotion(dt); updateAim(t, dt); } updateDoors(dt); } catch (e) {}
   try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
+  try { updateMenu(); } catch (e) { if (!window._menuErr) { window._menuErr = 1; console.error(e); } }
   renderer.render(scene, camera);
 });
 
