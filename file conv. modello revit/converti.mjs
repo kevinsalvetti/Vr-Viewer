@@ -1,7 +1,7 @@
 // Converte e ottimizza un modello Revit (OBJ / FBX / GLB / GLTF) per il viewer VR.
 // Uso: node converti.mjs "percorso\modello.obj"   (di solito lo lancia converti-modello.bat)
 import { spawnSync } from 'node:child_process';
-import { existsSync, unlinkSync } from 'node:fs';
+import { existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,16 +21,28 @@ function run(cmd, args, opts = {}) {
 }
 
 // 1) installazione strumenti (solo la prima volta, nella cartella dello script)
-if (!existsSync(path.join(here, 'node_modules', 'obj2gltf')) ||
-    !existsSync(path.join(here, 'node_modules', 'fbx2gltf')) ||
-    !existsSync(path.join(here, 'node_modules', '@gltf-transform', 'cli'))) {
-  console.log('Prima esecuzione: installo gli strumenti (serve internet, un paio di minuti)...\n');
-  if (existsSync(path.join(here, 'package.json'))) {
-    // reinstalla esattamente le versioni gia' provate (package.json + package-lock.json)
-    run('npm', ['install', '--no-audit', '--no-fund'], { cwd: here });
+// Tutti i pacchetti usati da questo script, con la versione esatta gia' provata (la stessa di package.json).
+// Se ne manca uno, o ce n'e' una versione diversa, si reinstalla tutto com'era: cosi' un aggiornamento
+// di una libreria non puo' rompere il convertitore.
+const DEPS = {
+  '@gltf-transform/cli': '4.5.1', '@gltf-transform/core': '4.5.1', '@gltf-transform/extensions': '4.5.1',
+  'draco3dgltf': '1.5.9', 'obj2gltf': '3.2.0', 'fbx2gltf': '0.9.7-p1'
+};
+const installedVersion = name => {
+  try { return JSON.parse(readFileSync(path.join(here, 'node_modules', ...name.split('/'), 'package.json'), 'utf8')).version; }
+  catch (e) { return null; }
+};
+const sameVersion = (a, b) => !!a && a.replace(/-/g, '') === b.replace(/-/g, '');   // fbx2gltf scrive "0.9.7p1"
+const missing = Object.keys(DEPS).filter(n => !sameVersion(installedVersion(n), DEPS[n]));
+if (missing.length) {
+  console.log('Installo gli strumenti (serve internet, un paio di minuti)...\nMancanti o diversi: ' + missing.join(', ') + '\n');
+  if (existsSync(path.join(here, 'package.json')) && existsSync(path.join(here, 'package-lock.json'))) {
+    // reinstalla esattamente l'albero gia' provato (package-lock.json), anche le dipendenze indirette
+    run('npm', ['ci', '--no-audit', '--no-fund'], { cwd: here });
   } else {
-    run('npm', ['init', '-y', '--silent'], { cwd: here });
-    run('npm', ['install', 'obj2gltf', 'fbx2gltf', '@gltf-transform/cli', '--no-audit', '--no-fund'], { cwd: here });
+    if (!existsSync(path.join(here, 'package.json'))) run('npm', ['init', '-y', '--silent'], { cwd: here });
+    run('npm', ['install', '--save-exact', '--no-audit', '--no-fund',
+      ...Object.entries(DEPS).map(([n, v]) => n + '@' + v)], { cwd: here });
   }
 }
 
@@ -39,7 +51,10 @@ const dir = path.dirname(path.resolve(input));
 const base = path.basename(input, path.extname(input));
 const tmp = path.join(dir, base + '__tmp.glb');
 const out = path.join(dir, base + '_quest.glb');
+const toRotate = path.join(dir, base + '__rot.glb');
 let source = input;
+// i file temporanei si cancellano sempre, anche se un passaggio fallisce (prima restavano accanto al modello)
+process.on('exit', () => { for (const f of [tmp, toRotate]) { try { if (existsSync(f)) unlinkSync(f); } catch (e) {} } });
 
 // 2) conversione in GLB (i colori e i materiali del file MTL / FBX vengono mantenuti)
 if (ext === '.obj') {
@@ -189,7 +204,6 @@ console.log('\nPorte apribili trovate: ' + doors + (doors ? '' : '  (controlla P
     }
   }
 }
-const toRotate = path.join(dir, base + '__rot.glb');
 await io.write(toRotate, doc);
 source = toRotate;
 
@@ -200,6 +214,4 @@ run(process.execPath, [path.join(here, 'node_modules', '@gltf-transform', 'cli',
   '--compress', 'draco', '--instance', 'false', '--sparse', 'false', '--join-named', 'false',
   '--palette', 'false', '--simplify', 'false', '--texture-size', texSize]);
 
-if (existsSync(tmp)) unlinkSync(tmp);
-if (toRotate && existsSync(toRotate)) unlinkSync(toRotate);
 console.log('\nFATTO. File creato:\n' + out);

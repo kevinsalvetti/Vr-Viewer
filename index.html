@@ -4316,6 +4316,11 @@ const VRButton = { createButton(renderer){
       for (const [mode, opts] of attempts) {
         try {
           session = await navigator.xr.requestSession(mode, opts);
+          // 'local-floor' solo se richiesto e concesso: altrimenti setSession fallirebbe (tentativo senza opzioni)
+          const feats = session.enabledFeatures;
+          const floor = (opts.optionalFeatures || []).includes('local-floor') && (!feats || feats.includes('local-floor'));
+          renderer.xr.floorMode = floor;
+          renderer.xr.setReferenceSpaceType(floor ? 'local-floor' : 'local');
           const bg = scene.background;
           if (mode === 'immersive-ar') scene.background = null;
           session.addEventListener('end', () => { scene.background = bg; session = null; b.textContent = 'Enter VR'; });
@@ -4369,13 +4374,42 @@ const file = document.getElementById('file');
 const scaleIn = document.getElementById('scale');
 const eyeIn = document.getElementById('eye');
 
+// Un solo loader per tutta la sessione: prima ogni caricamento creava un DRACOLoader nuovo, con 4 worker
+// (e il decoder WASM) che restavano in memoria per sempre.
+const dracoLoader = new THREE.DRACOLoader();
+const gltfLoader = new THREE.GLTFLoader();
+gltfLoader.setDRACOLoader(dracoLoader);
+let loadSeq = 0, loadsPending = 0;
+
+// libera la memoria della GPU (geometrie, materiali, texture) del modello che non serve piu'
+function disposeModel(m){
+  m.traverse(o => {
+    if (o.geometry) o.geometry.dispose();
+    if (o.material) for (const mat of [].concat(o.material)) {
+      for (const k in mat) { const v = mat[k]; if (v && v.isTexture) v.dispose(); }
+      mat.dispose();
+    }
+  });
+}
+
 function loadFile(f){
-  statusEl.textContent = 'Caricamento ' + f.name + '...';
-  const url = URL.createObjectURL(f);
-  const loader = new THREE.GLTFLoader();
-  loader.setDRACOLoader(new THREE.DRACOLoader());
-  loader.load(url, gltf => {
-    if (model) scene.remove(model);
+  statusEl.textContent = 'Caricamento ' + f.name + '...'; statusEl.style.color = '';
+  const url = URL.createObjectURL(f), seq = ++loadSeq;
+  loadsPending++;
+  // A caricamento finito si chiudono i worker Draco (si ricreano al prossimo), ma solo se nessun altro file
+  // si sta ancora caricando: chiuderli a meta' lascerebbe l'altro caricamento bloccato per sempre.
+  // done() puo' arrivare due volte (errore dentro onLoad -> onError): conta una volta sola.
+  let finished = false;
+  const done = () => {
+    if (finished) return; finished = true;
+    URL.revokeObjectURL(url);
+    if (--loadsPending === 0) dracoLoader.dispose();
+  };
+  gltfLoader.load(url, gltf => {
+    done();
+    if (seq !== loadSeq) { disposeModel(gltf.scene); return; }   // nel frattempo e' stato scelto un altro file
+    if (model) { scene.remove(model); disposeModel(model); }
+    doors.length = 0; Object.assign(COLL, { T: null, wall: null, owner: null, objs: [], grid: null, seen: null, key: '' });
     model = gltf.scene;
     model.traverse(o => { if (o.isMesh && o.material) {
       (Array.isArray(o.material) ? o.material : [o.material]).forEach(m => m.side = THREE.DoubleSide);
@@ -4383,9 +4417,20 @@ function loadFile(f){
     scene.add(model);
     model.userData.fileName = f.name;
     setupDoors();
+    freezeStatic();
     place();
     statusEl.textContent = 'Caricato: ' + f.name + (doors.length ? ' (' + doors.length + ' porte apribili)' : '') + '. Premi "Enter VR".';
-  }, undefined, e => { statusEl.textContent = 'Errore: ' + (e.message || e); });
+  }, undefined, e => {
+    done();
+    if (seq === loadSeq) { statusEl.textContent = 'Errore: ' + (e.message || e); statusEl.style.color = '#f66'; }
+  });
+}
+
+// Il modello e' fermo: tre.js non deve ricalcolare ogni fotogramma la matrice di ogni oggetto.
+// Restano "vive" solo le ante delle porte (si muovono); la radice si aggiorna a mano in place().
+function freezeStatic(){
+  const live = new Set(doors.map(d => d.obj));
+  model.traverse(o => { o.updateMatrix(); o.matrixAutoUpdate = live.has(o); });
 }
 
 function place(){
@@ -4397,6 +4442,7 @@ function place(){
     (parseFloat(document.getElementById('rx').value) || 0) * d,
     (parseFloat(document.getElementById('ry').value) || 0) * d,
     (parseFloat(document.getElementById('rz').value) || 0) * d);
+  model.updateMatrix();
   model.updateMatrixWorld(true);
   const box = new THREE.Box3().setFromObject(model);
   const c = box.getCenter(new THREE.Vector3());
@@ -4420,8 +4466,9 @@ const fwd = new THREE.Vector3(), right = new THREE.Vector3(), up = new THREE.Vec
 const turnModeEl = document.getElementById('turnMode');
 const turnSpeedEl = document.getElementById('turnSpeed');
 // ruota il "rig" attorno alla posizione della testa, così la vista non "sbanda"
+const _rotHead = new THREE.Vector3();
 function rotateAboutHead(angle){
-  const head = new THREE.Vector3().setFromMatrixPosition(renderer.xr.getCamera(camera).matrixWorld);
+  const head = _rotHead.setFromMatrixPosition(renderer.xr.getCamera(camera).matrixWorld);
   rig.position.sub(head).applyAxisAngle(up, angle).add(head);
   rig.rotation.y += angle;
 }
@@ -4464,7 +4511,10 @@ function locomotion(dt){
 let floorMode = true;   // true = lo 0 del visore è il pavimento reale
 renderer.xr.addEventListener('sessionstart', () => {
   const s = renderer.xr.getSession();
-  floorMode = !s.enabledFeatures || s.enabledFeatures.includes('local-floor');
+  floorMode = renderer.xr.floorMode !== false;           // deciso da VRButton insieme al reference space
+  last = -1;                                             // il tempo dei fotogrammi XR riparte da un'altra base
+  // foveazione fissa: meno pixel ai bordi della lente, molto piu' fluido sul Quest
+  try { const l = s.renderState.baseLayer; if (l && 'fixedFoveation' in l) l.fixedFoveation = 1; } catch (e) {}
   if (model) { place(); if (floorMode) rig.position.y -= (parseFloat(eyeIn.value) || 1.6); }
 });
 
@@ -4515,6 +4565,7 @@ function setupDoors(){
   });
 }
 function applyDoor(d){
+  d.dirty = true;                                        // i triangoli per le collisioni vanno ricalcolati
   if (d.slide) {                                         // scorrevole: angle = quanto e' aperta (0..1)
     _h.copy(d.w).multiplyScalar(d.side * d.travel * d.angle);
     d.obj.matrix.copy(d.M0).multiply(_T.makeTranslation(_h.x, _h.y, _h.z))
@@ -4560,19 +4611,20 @@ function doorOf(o){
   }
   return null;
 }
+const _pdO = new THREE.Vector3(), _pdD = new THREE.Vector3();
 function pickDoor(c){
   if (!model || !doors.length || rayBlocked(c)) return null;
-  c.updateMatrixWorld(true);
-  ray.set(new THREE.Vector3().setFromMatrixPosition(c.matrixWorld),
-          new THREE.Vector3(0, 0, -1).transformDirection(c.matrixWorld));
-  const h = ray.intersectObject(model, true)[0];
-  const d = h && h.distance < 6 && doorOf(h.object);
-  return d ? { door: d, dist: h.distance } : null;
+  c.updateWorldMatrix(true, true);
+  _pdO.setFromMatrixPosition(c.matrixWorld); _pdD.set(0, 0, -1).transformDirection(c.matrixWorld);
+  const h = castRay(_pdO, _pdD, 6);
+  const d = h && (h.door || doorOf(h.obj));
+  return d ? { door: d, dist: h.t } : null;
 }
 
+const _tpHead = new THREE.Vector3();
 function teleport(p){
   const xrCam = renderer.xr.getCamera(camera);
-  const head = new THREE.Vector3().setFromMatrixPosition(xrCam.matrixWorld);
+  const head = _tpHead.setFromMatrixPosition(xrCam.matrixWorld);
   rig.position.x += p.x - head.x;
   rig.position.z += p.z - head.z;
   rig.position.y = p.y + (floorMode ? 0 : (parseFloat(eyeIn.value) || 1.6));
@@ -4585,37 +4637,65 @@ function teleport(p){
 //  - mani: se un dito passerebbe oltre una superficie, tutta la mano si ferma sulla superficie
 //  - raggi: se il controller/la mano e' oltre un muro (visto dalla testa) il raggio si spegne
 const collEl = document.getElementById('coll');
-const COLL = { radius: 0.2, torso: 0.9, cell: 1, T: null, wall: null, grid: null, seen: null, stamp: 0, key: '' };
+// T: triangoli fermi in coordinate del mondo (9 numeri ciascuno) · owner: indice in objs della mesh di ogni triangolo
+const COLL = { radius: 0.2, torso: 0.9, cell: 1, T: null, wall: null, owner: null, objs: [], grid: null, seen: null, stamp: 0, key: '' };
 const cA = new THREE.Vector3(), cB = new THREE.Vector3(), cC = new THREE.Vector3(), cQ = new THREE.Vector3(),
       cD = new THREE.Vector3(), cP = new THREE.Vector3(), cPush = new THREE.Vector3(),
-      cTri = new THREE.Triangle(), cRay = new THREE.Ray(), cLocal = new THREE.Vector3(), _doorC = new THREE.Vector3();
+      cTri = new THREE.Triangle(), cRay = new THREE.Ray(), cLocal = new THREE.Vector3();
 const collOn = () => !!(COLL.T && (!collEl || collEl.checked));
 const cellHash = (x, y, z) => ((x * 73856093) ^ (y * 19349663) ^ (z * 83492791)) | 0;
 
+// triangoli di una geometria, trasformati con la matrice M, scritti in out a partire da off.
+// Ogni vertice si trasforma una volta sola (prima: una volta per ogni triangolo che lo usa).
+let _verts = new Float32Array(0);
+const triCount = g => Math.floor((g.index ? g.index.count : g.attributes.position.count) / 3);
+function writeTris(g, M, out, off){
+  const pos = g.attributes.position, nv = pos.count, I = g.index ? g.index.array : null;
+  if (_verts.length < nv * 3) _verts = new Float32Array(nv * 3);
+  const V = _verts;
+  for (let i = 0; i < nv; i++) { cA.fromBufferAttribute(pos, i).applyMatrix4(M); V[3 * i] = cA.x; V[3 * i + 1] = cA.y; V[3 * i + 2] = cA.z; }
+  const n = triCount(g) * 3;
+  for (let i = 0; i < n; i++) { const v = (I ? I[i] : i) * 3; out[off++] = V[v]; out[off++] = V[v + 1]; out[off++] = V[v + 2]; }
+  return off;
+}
+
 function buildCollision(){
   if (!model) return;
+  for (const d of doors) d.dirty = true;                 // il modello puo' essere stato spostato/scalato
   model.updateMatrixWorld(true);
   const key = model.matrixWorld.elements.map(v => v.toFixed(5)).join(',') + '|' + model.uuid;
   if (key === COLL.key) return;                          // modello non spostato: la griglia e' gia' giusta
   COLL.key = key;
-  const moving = new Set(doors.map(d => d.obj)), tri = [];
+  const moving = new Set(doors.map(d => d.obj)), objs = [];
   model.traverse(o => {
     if (!o.isMesh || !o.geometry || !o.geometry.attributes.position) return;
     for (let p = o; p && p !== model; p = p.parent) if (moving.has(p)) return;
-    const pos = o.geometry.attributes.position, idx = o.geometry.index, n = idx ? idx.count : pos.count;
-    for (let i = 0; i + 2 < n; i += 3) {
-      cA.fromBufferAttribute(pos, idx ? idx.getX(i) : i).applyMatrix4(o.matrixWorld);
-      cB.fromBufferAttribute(pos, idx ? idx.getX(i + 1) : i + 1).applyMatrix4(o.matrixWorld);
-      cC.fromBufferAttribute(pos, idx ? idx.getX(i + 2) : i + 2).applyMatrix4(o.matrixWorld);
-      tri.push(cA.x, cA.y, cA.z, cB.x, cB.y, cB.z, cC.x, cC.y, cC.z);
-    }
+    objs.push(o);
   });
-  const T = new Float32Array(tri), nt = T.length / 9, wall = new Uint8Array(nt), grid = new Map(), cs = COLL.cell;
+  // tutto in array tipizzati gia' della misura giusta (niente array JS con milioni di numeri)
+  let nt = 0; for (const o of objs) nt += triCount(o.geometry);
+  const T = new Float32Array(nt * 9), owner = new Int32Array(nt);
+  let off = 0;
+  objs.forEach((o, i) => { const t0 = off / 9; off = writeTris(o.geometry, o.matrixWorld, T, off); owner.fill(i, t0, off / 9); });
+  // Celle da 1 m, ma al massimo 256 celle per lato del modello. Se il modello e' in millimetri e la scala
+  // non e' ancora stata messa a 0.001, un edificio di 20 m misura 20000 unita': con celle da 1 un solo
+  // pavimento finirebbe in centinaia di milioni di celle e la pagina si bloccherebbe (o finirebbe la memoria).
+  let ext = 0;
+  for (let k = 0; k < 3; k++) {
+    let lo = Infinity, hi = -Infinity;
+    for (let i = k; i < T.length; i += 3) { const v = T[i]; if (v < lo) lo = v; if (v > hi) hi = v; }
+    if (hi > lo) ext = Math.max(ext, hi - lo);
+  }
+  const cs = COLL.cell = Math.max(1, ext / 256);
+  const wall = new Uint8Array(nt), grid = new Map();
   for (let t = 0; t < nt; t++) {
     const k = t * 9;
-    cA.fromArray(T, k); cB.fromArray(T, k + 3); cC.fromArray(T, k + 6);
-    cTri.set(cA, cB, cC); cTri.getNormal(cD);
-    wall[t] = Math.abs(cD.y) < 0.7 ? 1 : 0;              // verticale = muro (pavimenti e soffitti no)
+    const ux = T[k+3] - T[k], uy = T[k+4] - T[k+1], uz = T[k+5] - T[k+2];
+    const vx = T[k+6] - T[k], vy = T[k+7] - T[k+1], vz = T[k+8] - T[k+2];
+    const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    if (nl < 1e-12) continue;                            // triangolo degenere: non si tocca, non va nella griglia
+    wall[t] = Math.abs(ny) / nl < 0.7 ? 1 : 0;           // verticale = muro (pavimenti e soffitti no)
     const x0 = Math.floor(Math.min(T[k], T[k+3], T[k+6]) / cs), x1 = Math.floor(Math.max(T[k], T[k+3], T[k+6]) / cs);
     const y0 = Math.floor(Math.min(T[k+1], T[k+4], T[k+7]) / cs), y1 = Math.floor(Math.max(T[k+1], T[k+4], T[k+7]) / cs);
     const z0 = Math.floor(Math.min(T[k+2], T[k+5], T[k+8]) / cs), z1 = Math.floor(Math.max(T[k+2], T[k+5], T[k+8]) / cs);
@@ -4623,7 +4703,29 @@ function buildCollision(){
       const h = cellHash(x, y, z); let l = grid.get(h); if (!l) grid.set(h, l = []); l.push(t);
     }
   }
-  Object.assign(COLL, { T, wall, grid, seen: new Uint32Array(nt), stamp: 0 });
+  for (const [h, l] of grid) grid.set(h, Int32Array.from(l));   // meno memoria, lettura piu' veloce
+  Object.assign(COLL, { T, wall, owner, objs, grid, seen: new Uint32Array(nt), stamp: 0 });
+}
+
+// Triangoli di un'anta nella posizione attuale (coordinate del mondo) e il loro box.
+// Si ricalcolano solo quando l'anta si e' mossa (prima: a ogni controllo, molte volte per fotogramma).
+function doorTris(d){
+  if (d.T && !d.dirty) return d;
+  d.dirty = false;
+  d.obj.updateWorldMatrix(true, true);
+  if (!d.meshes) {                                       // tutte le mesh dell'anta (anche se ha piu' materiali)
+    d.meshes = []; d.obj.traverse(o => { if (o.isMesh && o.geometry && o.geometry.attributes.position) d.meshes.push(o); });
+    let n = 0; for (const m of d.meshes) n += triCount(m.geometry);
+    d.T = new Float32Array(n * 9); d.box = new THREE.Box3();
+  }
+  let off = 0; for (const m of d.meshes) off = writeTris(m.geometry, m.matrixWorld, d.T, off);
+  const D = d.T, b = d.box.makeEmpty();
+  for (let k = 0; k < D.length; k += 3) {
+    if (D[k] < b.min.x) b.min.x = D[k]; if (D[k] > b.max.x) b.max.x = D[k];
+    if (D[k+1] < b.min.y) b.min.y = D[k+1]; if (D[k+1] > b.max.y) b.max.y = D[k+1];
+    if (D[k+2] < b.min.z) b.min.z = D[k+2]; if (D[k+2] > b.max.z) b.max.z = D[k+2];
+  }
+  return d;
 }
 
 // chiama fn(a, b, c, isWall) per ogni triangolo (fermo o di una porta) che puo' toccare il box min..max
@@ -4635,24 +4737,18 @@ function forTrisIn(min, max, fn){
     for (let y = Math.floor(min.y / cs); y <= Math.floor(max.y / cs); y++)
       for (let z = Math.floor(min.z / cs); z <= Math.floor(max.z / cs); z++) {
         const l = COLL.grid.get(cellHash(x, y, z)); if (!l) continue;
-        for (const t of l) {
+        for (let i = 0; i < l.length; i++) {
+          const t = l[i];
           if (COLL.seen[t] === s) continue; COLL.seen[t] = s;
           const k = t * 9; cA.fromArray(T, k); cB.fromArray(T, k + 3); cC.fromArray(T, k + 6);
           if (fn(cA, cB, cC, COLL.wall[t]) === false) return;
         }
       }
   for (const d of doors) {                               // ante delle porte, nella posizione attuale
-    const o = d.obj, g = o.geometry; if (!g || !g.attributes.position) continue;
-    o.updateMatrixWorld(true);
-    if (!g.boundingSphere) g.computeBoundingSphere();
-    const bc = _doorC.copy(g.boundingSphere.center).applyMatrix4(o.matrixWorld);
-    const r = g.boundingSphere.radius * o.matrixWorld.getMaxScaleOnAxis();
-    if (bc.x + r < min.x || bc.x - r > max.x || bc.y + r < min.y || bc.y - r > max.y || bc.z + r < min.z || bc.z - r > max.z) continue;
-    const pos = g.attributes.position, idx = g.index, n = idx ? idx.count : pos.count;
-    for (let i = 0; i + 2 < n; i += 3) {
-      cA.fromBufferAttribute(pos, idx ? idx.getX(i) : i).applyMatrix4(o.matrixWorld);
-      cB.fromBufferAttribute(pos, idx ? idx.getX(i + 1) : i + 1).applyMatrix4(o.matrixWorld);
-      cC.fromBufferAttribute(pos, idx ? idx.getX(i + 2) : i + 2).applyMatrix4(o.matrixWorld);
+    const b = doorTris(d).box, D = d.T;
+    if (b.max.x < min.x || b.min.x > max.x || b.max.y < min.y || b.min.y > max.y || b.max.z < min.z || b.min.z > max.z) continue;
+    for (let k = 0; k < D.length; k += 9) {
+      cA.fromArray(D, k); cB.fromArray(D, k + 3); cC.fromArray(D, k + 6);
       if (fn(cA, cB, cC, 1) === false) return;
     }
   }
@@ -4677,20 +4773,90 @@ function wallPush(c, r, out){
   return out;
 }
 
+// distanza lungo il raggio (o, d) a cui si colpisce il triangolo A[k..k+8], oppure Infinity (Moller-Trumbore, due facce)
+function triRay(A, k, ox, oy, oz, dx, dy, dz){
+  const ax = A[k], ay = A[k+1], az = A[k+2];
+  const e1x = A[k+3] - ax, e1y = A[k+4] - ay, e1z = A[k+5] - az;
+  const e2x = A[k+6] - ax, e2y = A[k+7] - ay, e2z = A[k+8] - az;
+  const px = dy * e2z - dz * e2y, py = dz * e2x - dx * e2z, pz = dx * e2y - dy * e2x;
+  const det = e1x * px + e1y * py + e1z * pz;
+  if (det > -1e-14 && det < 1e-14) return Infinity;
+  const inv = 1 / det, sx = ox - ax, sy = oy - ay, sz = oz - az;
+  const u = (sx * px + sy * py + sz * pz) * inv; if (u < 0 || u > 1) return Infinity;
+  const qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x;
+  const v = (dx * qx + dy * qy + dz * qz) * inv; if (v < 0 || u + v > 1) return Infinity;
+  const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+  return t >= 0 ? t : Infinity;
+}
+
+// Primo punto del modello (fermo o porte) colpito dal raggio o + d*t con t <= far (d normalizzato).
+// Usa la stessa griglia delle collisioni: si visitano solo le celle attraversate dal raggio, dalla piu' vicina,
+// e ci si ferma appena il colpo trovato e' prima della cella successiva. Prima si controllava ogni triangolo
+// del modello (Raycaster di three.js), che con un modello Revit grande costava molti millisecondi.
+const HIT = { t: 0, point: new THREE.Vector3(), normal: new THREE.Vector3(), obj: null, door: null };
+function castRay(o, d, far){
+  if (!model) return null;
+  if (!COLL.T) {                                         // griglia non ancora pronta: metodo classico
+    ray.set(o, d); ray.far = far;
+    const h = ray.intersectObject(model, true)[0];
+    ray.far = 40;
+    if (!h) return null;
+    HIT.t = h.distance; HIT.point.copy(h.point); HIT.obj = h.object; HIT.door = null;
+    HIT.normal.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+    return HIT;
+  }
+  const ox = o.x, oy = o.y, oz = o.z, dx = d.x, dy = d.y, dz = d.z;
+  let best = far, bestA = null, bestK = -1, bestTri = -1, bestDoor = null;
+  cRay.set(o, d);
+  for (const dr of doors) {                              // ante: prima il box, poi i triangoli
+    const b = doorTris(dr).box;
+    if (b.isEmpty() || !cRay.intersectBox(b, cQ) || cQ.distanceTo(o) > best) continue;
+    const D = dr.T;
+    for (let k = 0; k < D.length; k += 9) {
+      const t = triRay(D, k, ox, oy, oz, dx, dy, dz);
+      if (t < best) { best = t; bestA = D; bestK = k; bestDoor = dr; bestTri = -1; }
+    }
+  }
+  const cs = COLL.cell, T = COLL.T, grid = COLL.grid, seen = COLL.seen;
+  if (++COLL.stamp > 4e9) { seen.fill(0); COLL.stamp = 1; }
+  const s = COLL.stamp;
+  let x = Math.floor(ox / cs), y = Math.floor(oy / cs), z = Math.floor(oz / cs);
+  const sx = dx > 0 ? 1 : dx < 0 ? -1 : 0, sy = dy > 0 ? 1 : dy < 0 ? -1 : 0, sz = dz > 0 ? 1 : dz < 0 ? -1 : 0;
+  const tdx = sx ? cs / Math.abs(dx) : Infinity, tdy = sy ? cs / Math.abs(dy) : Infinity, tdz = sz ? cs / Math.abs(dz) : Infinity;
+  let tmx = sx > 0 ? ((x + 1) * cs - ox) / dx : sx < 0 ? (x * cs - ox) / dx : Infinity;
+  let tmy = sy > 0 ? ((y + 1) * cs - oy) / dy : sy < 0 ? (y * cs - oy) / dy : Infinity;
+  let tmz = sz > 0 ? ((z + 1) * cs - oz) / dz : sz < 0 ? (z * cs - oz) / dz : Infinity;
+  for (let guard = 0; guard < 10000; guard++) {
+    const l = grid.get(cellHash(x, y, z));
+    if (l) for (let i = 0; i < l.length; i++) {
+      const tr = l[i];
+      if (seen[tr] === s) continue; seen[tr] = s;
+      const t = triRay(T, tr * 9, ox, oy, oz, dx, dy, dz);
+      if (t < best) { best = t; bestA = T; bestK = tr * 9; bestTri = tr; bestDoor = null; }
+    }
+    const tExit = Math.min(tmx, tmy, tmz);
+    if (!(tExit < best)) break;                          // colpo gia' trovato prima della prossima cella (o fine raggio)
+    if (tmx === tExit) { x += sx; tmx += tdx; }
+    else if (tmy === tExit) { y += sy; tmy += tdy; }
+    else { z += sz; tmz += tdz; }
+  }
+  if (!bestA) return null;
+  const A = bestA, k = bestK;
+  const ux = A[k+3] - A[k], uy = A[k+4] - A[k+1], uz = A[k+5] - A[k+2];
+  const vx = A[k+6] - A[k], vy = A[k+7] - A[k+1], vz = A[k+8] - A[k+2];
+  HIT.normal.set(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx).normalize();
+  HIT.t = best; HIT.point.set(ox + dx * best, oy + dy * best, oz + dz * best);
+  HIT.door = bestDoor; HIT.obj = bestDoor ? bestDoor.obj : COLL.objs[COLL.owner[bestTri]];
+  return HIT;
+}
+
 // primo punto in cui il segmento p0 -> p1 tocca il modello (o null)
-const _sDir = new THREE.Vector3(), _sHit = new THREE.Vector3();
+const _sDir = new THREE.Vector3();
 function segmentHit(p0, p1, out){
   const len = p0.distanceTo(p1); if (len < 1e-5) return null;
-  _sDir.subVectors(p1, p0).divideScalar(len); cRay.set(p0, _sDir);
-  _bMin.copy(p0).min(p1); _bMax.copy(p0).max(p1);
-  let best = len, found = false;
-  forTrisIn(_bMin, _bMax, (a, b, c) => {
-    if (cRay.intersectTriangle(a, b, c, false, _sHit)) {
-      const d = _sHit.distanceTo(p0);
-      if (d < best) { best = d; found = true; out.copy(_sHit); }
-    }
-  });
-  return found ? out : null;
+  _sDir.subVectors(p1, p0).divideScalar(len);
+  const h = castRay(p0, _sDir, len);
+  return h ? out.copy(h.point) : null;
 }
 
 // Posizione della testa. Il visore la da' riferita all'ultimo fotogramma disegnato, ma nel frattempo il rig
@@ -4703,17 +4869,21 @@ function captureHead(){
     .applyMatrix4(_rigInv.copy(rig.matrixWorld).invert());
   _rigStart.copy(rig.position);                          // dove eri a inizio fotogramma (posizione gia' valida)
 }
-function headW(){
-  rig.updateMatrixWorld();
-  return _headLocal.clone().applyMatrix4(rig.matrixWorld);
+// il rig e' figlio diretto della scena: basta la sua matrice locale (prima si aggiornava tutto il rig, con
+// controller, mani e ossa, a ogni chiamata) e il risultato va in un vettore gia' pronto (niente oggetti nuovi)
+const _headBody = new THREE.Vector3(), _headHand = new THREE.Vector3(), _headRay = new THREE.Vector3();
+function headW(out){
+  rig.updateMatrix();
+  return out.copy(_headLocal).applyMatrix4(rig.matrix);
 }
 
 // il corpo non attraversa i muri (stick, pinza, teletrasporto e anche camminando davvero nella stanza)
 function resolveBody(){
   if (!collOn()) return;
   _want.subVectors(rig.position, _rigStart);             // spostamento chiesto in questo fotogramma
-  const head = headW();
-  for (const dy of [0, -COLL.torso]) {                   // testa e busto
+  const head = headW(_headBody);
+  for (let part = 0; part < 2; part++) {                 // testa e busto
+    const dy = part ? -COLL.torso : 0;
     for (let it = 0; it < 6; it++) {
       cP.copy(head); cP.y += dy;
       wallPush(cP, COLL.radius, cPush);
@@ -4734,7 +4904,7 @@ function clampHand(st){
   st.offset = st.offset || new THREE.Vector3();
   st.offset.set(0, 0, 0);
   if (collOn() && st.handRoot) {
-    const head = headW();
+    const head = headW(_headHand);
     for (const n of HAND_TIPS) {
       const j = st.hand.joints[n]; if (!j) continue;
       j.getWorldPosition(_hp);
@@ -4753,8 +4923,8 @@ function clampHand(st){
 // vero se il controller / la mano e' oltre un muro rispetto alla testa
 function rayBlocked(c){
   if (!collOn()) return false;
-  c.updateMatrixWorld(true);
-  return !!segmentHit(headW(), cLocal.setFromMatrixPosition(c.matrixWorld), cQ);
+  c.updateWorldMatrix(true, true);                       // anche il rig: puo' essersi appena mosso
+  return !!segmentHit(headW(_headRay), cLocal.setFromMatrixPosition(c.matrixWorld), cQ);
 }
 
 for (let i = 0; i < 2; i++) {
@@ -4800,7 +4970,7 @@ for (let i = 0; i < 2; i++) {
 //  - raggio e cerchio "scivolano" verso il nuovo punto invece di saltare
 const aimO = new THREE.Vector3(), aimRawD = new THREE.Vector3(), aimD = new THREE.Vector3(),
       aimTarget = new THREE.Vector3(), aimShow = new THREE.Vector3(), aimLocal = new THREE.Vector3(),
-      MINUS_Z = new THREE.Vector3(0, 0, -1);
+      MINUS_Z = new THREE.Vector3(0, 0, -1), aimHit = new THREE.Vector3();
 aim.interval = 0; aim.fresh = true;
 
 function updateAim(t, dt){
@@ -4811,7 +4981,7 @@ function updateAim(t, dt){
     return;
   }
   line.visible = true;
-  c.updateMatrixWorld(true);
+  c.updateWorldMatrix(true, true);
   aimO.setFromMatrixPosition(c.matrixWorld);
   aimRawD.set(0, 0, -1).transformDirection(c.matrixWorld);
   if (aim.fresh) aimD.copy(aimRawD);                     // appena premuto: parte dalla direzione vera
@@ -4819,15 +4989,13 @@ function updateAim(t, dt){
 
   if (aim.fresh || t - aim.t >= aim.interval) {
     const t0 = performance.now();
-    ray.set(aimO, aimD);
-    const h = ray.intersectObject(model, true)[0];
+    const h = castRay(aimO, aimD, 40);
     const cost = performance.now() - t0;
     aim.interval = Math.min(Math.max(cost * 4 - 4, 0), 120);   // < 1 ms: ogni fotogramma
     aim.t = t;
     if (h) {
-      const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
-      aim.ok = aimD.y < -0.05 && Math.abs(n.y) > 0.7;    // solo superfici orizzontali (pavimenti)
-      aim.hit = h.point.clone();
+      aim.ok = aimD.y < -0.05 && Math.abs(h.normal.y) > 0.7;   // solo superfici orizzontali (pavimenti)
+      aim.hit = aimHit.copy(h.point);
       aimTarget.copy(h.point);
       marker.material.color.set(aim.ok ? 0x22cc66 : 0xcc3322);
       line.material.color.set(aim.ok ? 0x66ff99 : 0xff6655);
@@ -4920,14 +5088,19 @@ function makeHandMaterials(){
   return { depth, edge, fill };
 }
 
+const _handBuf = {};                               // GLB della mano gia' decodificato (si decodifica una volta sola)
 function b64ToBuffer(s){ const b = atob(s), u = new Uint8Array(b.length); for (let i = 0; i < b.length; i++) u[i] = b.charCodeAt(i); return u.buffer; }
 
 // carica il modello della mano giusta (destra/sinistra) quando il visore la riconosce
 function buildHandVisual(st){
   const handed = st.handed;
   if (st.handRoot) { st.hand.remove(st.handRoot); st.handRoot = null; }   // via subito il modello vecchio
+  if (st.vis && st.vis.ready) {                      // e libera la sua memoria della GPU
+    st.vis.matList.forEach(m => m.dispose()); st.vis.geometry.dispose();
+  }
   const token = st.vis = { handed, ready: false };
-  new THREE.GLTFLoader().parse(b64ToBuffer(HAND_GLB[handed]), '', gltf => {
+  const buf = _handBuf[handed] || (_handBuf[handed] = b64ToBuffer(HAND_GLB[handed]));
+  new THREE.GLTFLoader().parse(buf, '', gltf => {
     if (st.vis !== token) return;                     // nel frattempo la mano e' cambiata: risultato vecchio
     const root = gltf.scene, src = root.getObjectByProperty('type', 'SkinnedMesh');
     const mats = makeHandMaterials();
@@ -4938,10 +5111,10 @@ function buildHandVisual(st){
       src.parent.add(m); return m;
     };
     make(mats.depth, 10); make(mats.edge, 11); make(mats.fill, 12);
-    src.parent.remove(src);
+    src.parent.remove(src); [].concat(src.material).forEach(m => m.dispose());
     const bones = {}; HAND_JOINTS.forEach(n => { bones[n] = root.getObjectByName(n); });
     st.hand.add(root); st.handRoot = root;
-    st.vis = { handed, ready: true, root, mats, bones };
+    st.vis = { handed, ready: true, root, mats, bones, matList: [mats.depth, mats.edge, mats.fill], geometry: src.geometry };
   }, e => console.error('Modello mano:', e));
 }
 
@@ -4960,7 +5133,7 @@ function updateHandVisual(st){
   J['wrist'].getWorldPosition(_wW); J['middle-finger-phalanx-proximal'].getWorldPosition(_wM);
   const dir = _wM.sub(_wW).normalize();
   _wW.add(off);
-  for (const m of [v.mats.depth, v.mats.edge, v.mats.fill]) { m.uniforms.wrist.value.copy(_wW); m.uniforms.dir.value.copy(dir); }
+  for (const m of v.matList) { m.uniforms.wrist.value.copy(_wW); m.uniforms.dir.value.copy(dir); }
   const f = v.mats.fill.uniforms;
   if (st.pinching) {                                         // pinza medio+pollice: arancio
     J['middle-finger-tip'].getWorldPosition(f.g1.value); J['thumb-tip'].getWorldPosition(f.g2.value);
@@ -5183,15 +5356,22 @@ function updateMenu(){
 }
 renderer.xr.addEventListener('sessionend', () => { if (vrMenu.open) closeMenu(); });
 
-let last = 0;
+// Ogni parte del ciclo e' protetta: un errore viene scritto in console una volta sola e il resto continua.
+// Anche il disegno e' protetto: in three.js un'eccezione non gestita qui ferma il ciclo per sempre
+// (il fotogramma successivo viene chiesto solo dopo) e nel visore l'immagine resterebbe congelata.
+let last = -1;
+const _loggedErr = {};
+function logOnce(where, e){ if (!_loggedErr[where]) { _loggedErr[where] = 1; console.error('[' + where + ']', e); } }
 renderer.setAnimationLoop(t => {
-  const dt = Math.min((t - last) / 1000, 0.1); last = t;
-  try { syncInputSources(); captureHead(); } catch (e) {}
-  try { if (!vrMenu.open) { locomotion(dt); updateAim(t, dt); } updateDoors(dt); } catch (e) {}
-  try { handsLoop(dt); updateHandRays(); } catch (e) { if (!window._handErr) { window._handErr = 1; console.error(e); } }
-  try { updateMenu(); } catch (e) { if (!window._menuErr) { window._menuErr = 1; console.error(e); } }
-  try { resolveBody(); } catch (e) { if (!window._collErr) { window._collErr = 1; console.error(e); } }
-  renderer.render(scene, camera);
+  // dt tra 0 e 0,1 s: all'ingresso in VR il tempo dei fotogrammi cambia base e potrebbe tornare indietro
+  const dt = last < 0 ? 0 : Math.min(Math.max((t - last) / 1000, 0), 0.1); last = t;
+  try { syncInputSources(); captureHead(); } catch (e) { logOnce('input', e); }
+  try { if (!vrMenu.open) { locomotion(dt); updateAim(t, dt); } } catch (e) { logOnce('movimento', e); }
+  try { updateDoors(dt); } catch (e) { logOnce('porte', e); }
+  try { handsLoop(dt); updateHandRays(); } catch (e) { logOnce('mani', e); }
+  try { updateMenu(); } catch (e) { logOnce('menu', e); }
+  try { resolveBody(); } catch (e) { logOnce('collisioni', e); }
+  try { renderer.render(scene, camera); } catch (e) { logOnce('render', e); }
 });
 
 addEventListener('resize', () => {
