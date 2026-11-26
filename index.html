@@ -13,10 +13,21 @@
   #ui input[type=number]{width:80px}
   #status{margin-top:8px;font-size:13px;color:#9cf}
   #vrbtn{margin-top:10px}
+  .sbtn{padding:6px 10px;font-size:13px;border-radius:6px;border:0;background:#456;color:#fff;cursor:pointer}
+  .sbtn:hover{background:#567}
+  #planBar{display:none;position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:6;background:#000c;color:#eee;
+    padding:10px 14px;border-radius:10px;font-size:13px;max-width:calc(100% - 32px);box-sizing:border-box;text-align:center;line-height:1.6}
+  #planBar input{width:60px}
+  #planBar .sbtn{background:#2a7;margin-left:6px}
   #vrbtn button{position:static!important;display:block;width:100%;padding:12px;font-size:16px;border-radius:8px;border:0;background:#2a7;color:#fff;cursor:pointer}
 </style>
 </head>
 <body>
+<div id="planBar">
+  <b>Clic sul pavimento</b> = punto di partenza · <b>trascina</b> = direzione dello sguardo · rotella = zoom · tasto destro trascinato = sposta la pianta
+  <br>Taglio della pianta a <input type="number" id="planCut" value="1.5" step="0.5"> m sopra il piano più basso (alzalo per i piani superiori)
+  <button id="planDone" class="sbtn">Fatto</button>
+</div>
 <div id="ui">
   <h1>Revit VR Viewer</h1>
   <label>1. Scegli il modello (.glb / .gltf)</label>
@@ -25,6 +36,10 @@
   <input type="number" id="scale" value="1" step="0.001">
   <label>Altezza occhi (m)</label>
   <input type="number" id="eye" value="1.6" step="0.1">
+  <label>Punto di partenza in VR</label>
+  <button id="spawnPick" class="sbtn">Scegli sulla pianta</button>
+  <button id="spawnClear" class="sbtn">Centro del modello</button>
+  <div id="spawnInfo" style="font-size:12px;opacity:.8;margin-top:3px">Partenza: centro del modello</div>
   <label>Rotazione modello in gradi (X / Y / Z) &mdash; se è sdraiato prova X = -90</label>
   <input type="number" id="rx" value="0" step="90" style="width:70px">
   <input type="number" id="ry" value="0" step="90" style="width:70px">
@@ -4422,6 +4437,8 @@ function loadFile(f){
     }});
     scene.add(model);
     model.userData.fileName = f.name;
+    if (plan.on) closePlan();
+    loadSpawn(); showSpawnInfo();                       // punto di partenza salvato per questo file
     setupDoors();
     freezeStatic();
     place();
@@ -4450,10 +4467,19 @@ function place(){
     (parseFloat(document.getElementById('rz').value) || 0) * d);
   model.updateMatrix();
   model.updateMatrixWorld(true);
-  const box = new THREE.Box3().setFromObject(model);
-  const c = box.getCenter(new THREE.Vector3());
-  // parte dal centro del modello, all'altezza del piano più basso + altezza occhi
-  rig.position.set(c.x, box.min.y + (parseFloat(eyeIn.value) || 1.6), c.z);
+  const eye = parseFloat(eyeIn.value) || 1.6;
+  if (spawn) {
+    // punto di partenza scelto sulla pianta (salvato nelle coordinate del modello: regge scala e rotazione)
+    const p = model.localToWorld(new THREE.Vector3().fromArray(spawn.p));
+    rig.position.set(p.x, p.y + eye, p.z);
+    rig.rotation.y = spawn.yaw;
+  } else {
+    const box = new THREE.Box3().setFromObject(model);
+    const c = box.getCenter(new THREE.Vector3());
+    // parte dal centro del modello, all'altezza del piano più basso + altezza occhi
+    rig.position.set(c.x, box.min.y + eye, c.z);
+    rig.rotation.y = 0;
+  }
   buildCollision();                                     // griglia per le collisioni (solo se il modello e' cambiato)
 }
 
@@ -4463,6 +4489,155 @@ eyeIn.addEventListener('change', place);
 ['rx','ry','rz'].forEach(id => document.getElementById(id).addEventListener('change', place));
 addEventListener('dragover', e => e.preventDefault());
 addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+// ---- Punto di partenza scelto sulla pianta (prima di entrare in VR) ----
+// La pianta e' una vista dall'alto con il modello "tagliato" a un'altezza scelta, cosi' i soffitti non
+// coprono le stanze. Clic sul pavimento = punto, trascinando = direzione dello sguardo. Il punto viene
+// ricordato per quel file (in questo browser) e usato da place() quando entri in VR.
+let spawn = null;                                       // { p: [x,y,z] nel modello, yaw: radianti }
+const spawnKey = () => 'vrviewer-spawn:' + ((model && model.userData.fileName) || '');
+function loadSpawn(){ try { const s = JSON.parse(localStorage.getItem(spawnKey())); spawn = s && s.p ? s : null; } catch (e) { spawn = null; } }
+function saveSpawn(){ try { spawn ? localStorage.setItem(spawnKey(), JSON.stringify(spawn)) : localStorage.removeItem(spawnKey()); } catch (e) {} }
+const spawnInfo = document.getElementById('spawnInfo');
+function showSpawnInfo(){
+  spawnInfo.textContent = spawn ? 'Partenza: punto scelto sulla pianta (sguardo ' +
+    Math.round(((-spawn.yaw * 180 / Math.PI) % 360 + 360) % 360) + '°)' : 'Partenza: centro del modello';
+}
+
+const plan = { on: false, cam: new THREE.OrthographicCamera(-1, 1, 1, -1, 0.1, 5000), drag: null, pan: null, box: null };
+const planBar = document.getElementById('planBar'), planCutEl = document.getElementById('planCut');
+const planClip = new THREE.Plane(new THREE.Vector3(0, -1, 0), 0);   // tiene solo cio' che sta sotto il taglio
+const planRay = new THREE.Raycaster();
+const spawnMark = new THREE.Group();
+{
+  const mat = new THREE.MeshBasicMaterial({ color: 0x22cc66, depthTest: false });
+  const ring = new THREE.Mesh(new THREE.RingGeometry(0.22, 0.34, 40).rotateX(-Math.PI / 2), mat);
+  const arrow = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.6, 3).rotateX(-Math.PI / 2).translate(0, 0, -0.75), mat);
+  ring.renderOrder = arrow.renderOrder = 1000;
+  spawnMark.add(ring, arrow); spawnMark.visible = false; scene.add(spawnMark);
+}
+function planCutY(){ return plan.box.min.y + (parseFloat(planCutEl.value) || 1.5); }
+function fitPlan(){
+  const b = plan.box, c = b.getCenter(new THREE.Vector3()), cam = plan.cam;
+  const half = Math.max(b.max.x - b.min.x, b.max.z - b.min.z) * 0.6 + 1, a = innerWidth / innerHeight;
+  cam.left = -half * a; cam.right = half * a; cam.top = half; cam.bottom = -half; cam.zoom = 1;
+  cam.position.set(c.x, b.max.y + 50, c.z); cam.up.set(0, 0, -1); cam.lookAt(c.x, b.min.y, c.z);
+  cam.updateProjectionMatrix();
+}
+function updateSpawnMark(){
+  spawnMark.visible = plan.on && !!spawn;
+  if (!spawnMark.visible) return;
+  const p = model.localToWorld(new THREE.Vector3().fromArray(spawn.p));
+  const s = 1 / plan.cam.zoom;                           // il segnaposto resta leggibile con lo zoom
+  spawnMark.position.set(p.x, p.y + 0.05, p.z); spawnMark.rotation.y = spawn.yaw; spawnMark.scale.setScalar(Math.max(s, 0.4));
+}
+// I muri tagliati sono "vuoti" e dall'alto si vedrebbero appena: si calcolano le linee di sezione
+// (dove i triangoli attraversano il piano di taglio) e si disegnano scure, come in una pianta vera.
+const planSection = new THREE.LineSegments(new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: 0x1d2329, depthTest: false }));
+planSection.renderOrder = 999; planSection.visible = false; scene.add(planSection);
+function buildSection(y){
+  const out = [], a = new THREE.Vector3(), b = new THREE.Vector3(), c = new THREE.Vector3();
+  const cut = (p, q) => { const t = (y - p.y) / (q.y - p.y); out.push(p.x + (q.x - p.x) * t, y, p.z + (q.z - p.z) * t); };
+  model.updateMatrixWorld(true);
+  model.traverse(o => {
+    if (!o.isMesh || !o.geometry.attributes.position) return;
+    const pos = o.geometry.attributes.position, idx = o.geometry.index, m = o.matrixWorld;
+    const n = idx ? idx.count : pos.count, at = i => idx ? idx.getX(i) : i;
+    for (let i = 0; i + 2 < n; i += 3) {
+      a.fromBufferAttribute(pos, at(i)).applyMatrix4(m);
+      b.fromBufferAttribute(pos, at(i + 1)).applyMatrix4(m);
+      c.fromBufferAttribute(pos, at(i + 2)).applyMatrix4(m);
+      const sa = a.y > y, sb = b.y > y, sc = c.y > y;
+      if (sa === sb && sb === sc) continue;               // il triangolo non attraversa il taglio
+      if (sa !== sb) cut(a, b);
+      if (sb !== sc) cut(b, c);
+      if (sc !== sa) cut(c, a);
+    }
+  });
+  planSection.geometry.dispose();
+  planSection.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute(out, 3));
+}
+function renderPlan(){ renderer.render(scene, plan.cam); }
+function setPlanClip(){
+  planClip.constant = planCutY(); renderer.clippingPlanes = plan.on ? [planClip] : [];
+  planSection.visible = plan.on;
+  if (plan.on) buildSection(planClip.constant - 0.001);
+}
+function openPlan(){
+  if (!model) { statusEl.textContent = 'Carica prima un modello.'; return; }
+  if (renderer.xr.isPresenting) return;
+  plan.on = true; plan.box = new THREE.Box3().setFromObject(model);
+  fitPlan(); setPlanClip(); updateSpawnMark();
+  planBar.style.display = 'block';
+}
+function closePlan(){
+  if (!plan.on) return;
+  plan.on = false; plan.drag = plan.pan = null;
+  renderer.clippingPlanes = []; spawnMark.visible = false; planSection.visible = false; planBar.style.display = 'none';
+  place();                                               // anteprima sul desktop: la vista dal punto scelto
+}
+function planPointer(e){
+  const r = renderer.domElement.getBoundingClientRect();
+  plan.cam.updateMatrixWorld();                          // dopo zoom/spostamenti, prima del prossimo fotogramma
+  planRay.setFromCamera({ x: (e.clientX - r.left) / r.width * 2 - 1, y: -(e.clientY - r.top) / r.height * 2 + 1 }, plan.cam);
+  return planRay;
+}
+// primo punto colpito sotto il taglio (il raggio non vede il piano di taglio, quindi si filtra a mano)
+function planHit(e){
+  const cut = planCutY() + 0.01;
+  for (const h of planPointer(e).intersectObject(model, true)) {
+    if (h.point.y > cut) continue;
+    const n = h.face.normal.clone().transformDirection(h.object.matrixWorld);
+    return { point: h.point, floor: Math.abs(n.y) > 0.6 };   // abs: in alcuni modelli Revit le facce sono girate
+  }
+  return null;
+}
+const cvs = renderer.domElement;
+cvs.addEventListener('contextmenu', e => { if (plan.on) e.preventDefault(); });
+cvs.addEventListener('pointerdown', e => {
+  if (!plan.on) return;
+  if (e.button === 2 || e.button === 1) { plan.pan = { x: e.clientX, y: e.clientY }; cvs.setPointerCapture(e.pointerId); return; }
+  const h = planHit(e);
+  if (!h || !h.floor) { statusEl.textContent = 'Clicca su un pavimento (se non lo vedi, cambia l\'altezza del taglio).'; return; }
+  const local = model.worldToLocal(h.point.clone());
+  spawn = { p: local.toArray().map(v => +v.toFixed(3)), yaw: spawn ? spawn.yaw : 0 };
+  plan.drag = { y: h.point.y, start: h.point.clone() };
+  cvs.setPointerCapture(e.pointerId);
+  updateSpawnMark(); showSpawnInfo();
+});
+cvs.addEventListener('pointermove', e => {
+  if (!plan.on) return;
+  if (plan.pan) {
+    const cam = plan.cam, k = (cam.right - cam.left) / cam.zoom / cvs.clientWidth;
+    // con up = -Z: destra sullo schermo = +X, giu' sullo schermo = +Z
+    cam.position.x -= (e.clientX - plan.pan.x) * k; cam.position.z -= (e.clientY - plan.pan.y) * k;
+    plan.pan = { x: e.clientX, y: e.clientY }; return;
+  }
+  if (!plan.drag) return;
+  const r = planPointer(e).ray, t = (plan.drag.y - r.origin.y) / r.direction.y;
+  if (!isFinite(t)) return;
+  const p = r.origin.clone().addScaledVector(r.direction, t);
+  const dx = p.x - plan.drag.start.x, dz = p.z - plan.drag.start.z;
+  if (dx * dx + dz * dz > 0.04) { spawn.yaw = Math.atan2(-dx, -dz); updateSpawnMark(); showSpawnInfo(); }
+});
+const endPlanDrag = () => { if (plan.drag) { plan.drag = null; saveSpawn(); statusEl.textContent = 'Punto di partenza salvato. Premi "Fatto" o entra in VR.'; } plan.pan = null; };
+cvs.addEventListener('pointerup', endPlanDrag);
+cvs.addEventListener('pointercancel', endPlanDrag);
+cvs.addEventListener('wheel', e => {
+  if (!plan.on) return;
+  e.preventDefault();
+  const cam = plan.cam, before = planPointer(e).ray.origin.clone();
+  cam.zoom = Math.min(Math.max(cam.zoom * Math.exp(-e.deltaY * 0.0015), 0.5), 40); cam.updateProjectionMatrix();
+  const after = planPointer(e).ray.origin;               // zoom verso il punto sotto il mouse
+  cam.position.x += before.x - after.x; cam.position.z += before.z - after.z;
+  updateSpawnMark();
+}, { passive: false });
+planCutEl.addEventListener('input', () => { if (plan.on) setPlanClip(); });
+document.getElementById('planDone').addEventListener('click', closePlan);
+document.getElementById('spawnPick').addEventListener('click', openPlan);
+document.getElementById('spawnClear').addEventListener('click', () => { spawn = null; saveSpawn(); showSpawnInfo(); updateSpawnMark(); if (!plan.on) place(); });
+addEventListener('resize', () => { if (plan.on) { const z = plan.cam.zoom, p = plan.cam.position.clone(); fitPlan(); plan.cam.zoom = z; plan.cam.position.copy(p); plan.cam.updateProjectionMatrix(); } });
 
 // ---- Locomozione con i controller ----
 const dead = 0.15;
@@ -4516,6 +4691,7 @@ renderer.xr.addEventListener('sessionstart', () => {
   last = -1;                                             // il tempo dei fotogrammi XR riparte da un'altra base
   // foveazione fissa: meno pixel ai bordi della lente, molto piu' fluido sul Quest
   try { const l = s.renderState.baseLayer; if (l && 'fixedFoveation' in l) l.fixedFoveation = 1; } catch (e) {}
+  if (plan.on) closePlan();                              // la pianta serve solo prima di entrare
   if (model) { place(); if (floorMode) rig.position.y -= (parseFloat(eyeIn.value) || 1.6); }
 });
 
@@ -5489,7 +5665,7 @@ renderer.setAnimationLoop(t => {
   try { updateControllers(); } catch (e) { logOnce('controller', e); }
   try { updateMenu(); } catch (e) { logOnce('menu', e); }
   try { resolveBody(); } catch (e) { logOnce('collisioni', e); }
-  try { renderer.render(scene, camera); } catch (e) { logOnce('render', e); }
+  try { if (plan.on && !renderer.xr.isPresenting) renderPlan(); else renderer.render(scene, camera); } catch (e) { logOnce('render', e); }
 });
 
 addEventListener('resize', () => {
