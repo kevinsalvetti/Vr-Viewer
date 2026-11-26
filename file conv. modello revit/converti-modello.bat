@@ -20,9 +20,13 @@ set ROTY=0
 set ROTZ=0
 rem Porte apribili nel viewer: nomi (o parte dei nomi) dei TIPI di porta di Revit, separati da virgola.
 rem Esempio: set PORTE=80x210,90x210,Porta interna    (scrivi "set PORTE=nessuna" per non avere porte apribili)
-set PORTE=80x210
+set PORTE=80x210,90x210
 rem Nome (o parte del nome) del materiale dell'anta della porta
 set ANTA=Ante
+rem Porte SCORREVOLI (anche a scomparsa): nomi dei TIPI di Revit, separati da virgola.
+rem L'anta viene riconosciuta dalla forma (lastra sottile e alta), non serve il materiale.
+rem Scrivi "set SCORREVOLI=nessuna" se il modello non ne ha.
+set SCORREVOLI=100x210
 rem Dimensione massima delle texture (2048 = alta qualita', 1024 = piu' leggero)
 set TEXSIZE=2048
 
