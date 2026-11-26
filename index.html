@@ -37,7 +37,7 @@
   <div id="vrbtn"></div>
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
-  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra e muovi la mano avanti/indietro/lati = cammini · stessa pinza con la destra: lati = ruoti, su/giù = sali/scendi
+  <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra (o la destra, si sceglie dal menu in VR) e muovi la mano avanti/indietro = cammini avanti/indietro
   <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · punta un bottone e premi il grilletto
   <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata) · porte scorrevoli: stesso gesto, l'anta scorre di lato; tieni premuto 1 secondo = scorre dall'altra parte</div>
 </div>
@@ -4660,18 +4660,20 @@ function forTrisIn(min, max, fn){
 
 // spinta orizzontale che allontana una sfera (centro c, raggio r) dai muri vicini
 const _bMin = new THREE.Vector3(), _bMax = new THREE.Vector3();
+// Si prende solo il contatto piu' profondo e si spinge esattamente quanto serve per tornare a filo:
+// un muro e' fatto di molti triangoli, e sommare le spinte di tutti faceva "rimbalzare" indietro.
+// Gli angoli (due muri insieme) si risolvono con piu' passaggi in resolveBody.
 function wallPush(c, r, out){
   out.set(0, 0, 0);
+  let best = 0;
   _bMin.set(c.x - r, c.y - r, c.z - r); _bMax.set(c.x + r, c.y + r, c.z + r);
   forTrisIn(_bMin, _bMax, (a, b, cc, isWall) => {
     if (!isWall) return;
     cTri.set(a, b, cc); cTri.closestPointToPoint(c, cQ);
     cD.subVectors(c, cQ); cD.y = 0;
-    const dist = cD.length();
-    if (dist < r && dist > 1e-5) out.addScaledVector(cD, (r - dist) / dist);
+    const dist = cD.length(), pen = r - dist;
+    if (pen > best && dist > 1e-5) { best = pen; out.copy(cD).multiplyScalar(pen / dist); }
   });
-  const l = out.length(), max = r;                       // spinte di piu' muri insieme: mai oltre il raggio
-  if (l > max) out.multiplyScalar(max / l);
   return out;
 }
 
@@ -4695,9 +4697,11 @@ function segmentHit(p0, p1, out){
 // puo' essersi gia' spostato (stick, pinza, teletrasporto): la salviamo rispetto al rig a inizio fotogramma
 // (captureHead) e la riportiamo sempre nella posizione attuale del rig.
 const _headLocal = new THREE.Vector3(), _rigInv = new THREE.Matrix4();
+const _rigStart = new THREE.Vector3(), _want = new THREE.Vector3(), _net = new THREE.Vector3();
 function captureHead(){
   _headLocal.setFromMatrixPosition((renderer.xr.isPresenting ? renderer.xr.getCamera(camera) : camera).matrixWorld)
     .applyMatrix4(_rigInv.copy(rig.matrixWorld).invert());
+  _rigStart.copy(rig.position);                          // dove eri a inizio fotogramma (posizione gia' valida)
 }
 function headW(){
   rig.updateMatrixWorld();
@@ -4707,15 +4711,20 @@ function headW(){
 // il corpo non attraversa i muri (stick, pinza, teletrasporto e anche camminando davvero nella stanza)
 function resolveBody(){
   if (!collOn()) return;
+  _want.subVectors(rig.position, _rigStart);             // spostamento chiesto in questo fotogramma
   const head = headW();
   for (const dy of [0, -COLL.torso]) {                   // testa e busto
-    for (let it = 0; it < 3; it++) {
+    for (let it = 0; it < 6; it++) {
       cP.copy(head); cP.y += dy;
       wallPush(cP, COLL.radius, cPush);
-      if (cPush.lengthSq() < 1e-10) break;
+      if (cPush.lengthSq() < 1e-8) break;               // meno di 0,1 mm: gia' a filo
       rig.position.add(cPush); head.add(cPush);
     }
   }
+  // protezione anti-rimbalzo (angoli e spigoli): se la correzione ti porterebbe piu' indietro di dove eri
+  // a inizio fotogramma, resti fermo li' (in orizzontale), che e' sempre una posizione valida
+  _want.y = 0; _net.subVectors(rig.position, _rigStart); _net.y = 0;
+  if (_want.lengthSq() > 1e-10 && _net.dot(_want) < 0) { rig.position.x = _rigStart.x; rig.position.z = _rigStart.z; }
 }
 
 // la mano non entra nei muri: se un dito andrebbe oltre una superficie, tutta la mano si ferma li'
@@ -5012,6 +5021,15 @@ function syncInputSources(){
 const hf = new THREE.Vector3(), hr = new THREE.Vector3(), hd3 = new THREE.Vector3();
 const hz = v => Math.sign(v) * Math.min(Math.max((Math.abs(v) - 0.03) / 0.12, 0), 1);   // zona morta 3 cm, massimo a 15 cm
 
+// mano che cammina con la pinza medio+pollice ('left' o 'right'), si cambia dal menu in VR e viene ricordata
+let walkHand = 'left';
+try { if (localStorage.getItem('walkHand') === 'right') walkHand = 'right'; } catch (e) {}
+function setWalkHand(h){
+  walkHand = h;
+  for (const st of handStates) st.pinching = false;          // annulla una camminata in corso
+  try { localStorage.setItem('walkHand', h); } catch (e) {}
+}
+
 function handsLoop(dt){
   if (!renderer.xr.isPresenting) return;
   renderer.xr.getCamera(camera).getWorldDirection(hf);
@@ -5023,7 +5041,8 @@ function handsLoop(dt){
     // quanto sono vicini indice e pollice (0 = aperti, 1 = pinza chiusa): illumina i polpastrelli e il raggio
     st.pinchStrength = (index && thumb) ?
       Math.min(Math.max((0.06 - index.position.distanceTo(thumb.position)) / 0.04, 0), 1) : 0;
-    if (!mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; updateHandVisual(st); continue; }
+    // la pinza medio+pollice (camminata) vale solo per la mano scelta nel menu
+    if (st.handed !== walkHand || !mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; updateHandVisual(st); continue; }
     const dist = mid.position.distanceTo(thumb.position);
     if (!st.pinching && dist < 0.025) { st.pinching = true; st.anchor.copy(mid.position); }
     else if (st.pinching && dist > 0.04) st.pinching = false;
@@ -5031,14 +5050,9 @@ function handsLoop(dt){
     if (!st.pinching || vrMenu.open) continue;                  // menu aperto: non ci si muove
     // spostamento della mano rispetto a dove è iniziata la pinza, nel sistema "testa"
     hd3.copy(mid.position).sub(st.anchor).applyAxisAngle(up, rig.rotation.y);
-    const fz = hz(hd3.dot(hf)), fx = hz(hd3.dot(hr)), fy = hz(hd3.y);
-    if (st.handed === 'left') {
-      rig.position.addScaledVector(hf, fz * 2 * dt);
-      rig.position.addScaledVector(hr, fx * 2 * dt);
-    } else {
-      rotateAboutHead(-fx * (parseFloat(turnSpeedEl.value) || 90) * Math.PI / 180 * dt);
-      rig.position.y += fy * 1.5 * dt;
-    }
+    // solo avanti/indietro, nella direzione in cui guardi
+    const fz = hz(hd3.dot(hf));
+    rig.position.addScaledVector(hf, fz * 2 * dt);
   }
 }
 
@@ -5057,12 +5071,16 @@ function updateHandRays(){
 // ---- Menu in VR (tasto menu del controller sinistro, o Y) ----
 // Un pannello compare davanti a te; punta un bottone e premi il grilletto (o fai la pinza indice+pollice).
 //  - "Torna alla VR": chiude il menu
+//  - "Camminata Fluida: mano ...": sceglie quale mano cammina con la pinza medio+pollice
 //  - "Esci dalla VR": termina la sessione e torna alla pagina
 // Mentre il menu e' aperto non ci si muove e non si aprono porte.
 const vrMenu = { open: false, mesh: null, ctx: null, tex: null, hover: -1, prev: new WeakMap(),
-  W: 1024, H: 620, size: [0.62, 0.62 * 620 / 1024],
+  W: 1024, H: 810, size: [0.62, 0.62 * 810 / 1024],
   buttons: [ { label: 'Torna alla VR', x: 112, y: 190, w: 800, h: 150, color: '#2a9d6a', act: () => closeMenu() },
-             { label: 'Esci dalla VR', x: 112, y: 380, w: 800, h: 150, color: '#c0453a',
+             { label: () => 'Camminata Fluida: mano ' + (walkHand === 'left' ? 'sinistra' : 'destra'),
+               x: 112, y: 380, w: 800, h: 150, color: '#3a6fc0',
+               act: () => { setWalkHand(walkHand === 'left' ? 'right' : 'left'); drawMenu(); } },
+             { label: 'Esci dalla VR', x: 112, y: 570, w: 800, h: 150, color: '#c0453a',
                act: () => { closeMenu(); const s = renderer.xr.getSession(); if (s) s.end(); } } ] };
 (function buildMenu(){
   const cv = document.createElement('canvas'); cv.width = vrMenu.W; cv.height = vrMenu.H;
@@ -5090,8 +5108,11 @@ function drawMenu(){
     roundRect(g, b.x, b.y, b.w, b.h, 36);
     g.fillStyle = b.color; g.globalAlpha = hov ? 1 : 0.6; g.fill(); g.globalAlpha = 1;
     if (hov) { g.lineWidth = 8; g.strokeStyle = '#fff'; g.stroke(); }
-    g.fillStyle = '#fff'; g.font = 'bold 60px system-ui, sans-serif';
-    g.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2 + 2);
+    const txt = typeof b.label === 'function' ? b.label() : b.label;
+    let fs = 60; g.font = 'bold ' + fs + 'px system-ui, sans-serif';
+    while (fs > 30 && g.measureText(txt).width > b.w - 60) { fs -= 2; g.font = 'bold ' + fs + 'px system-ui, sans-serif'; }   // testi lunghi: rimpicciolisci
+    g.fillStyle = '#fff';
+    g.fillText(txt, b.x + b.w / 2, b.y + b.h / 2 + 2);
   });
   vrMenu.tex.needsUpdate = true;
 }
