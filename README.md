@@ -4,6 +4,7 @@ https://kevinsalvetti.github.io/Vr-Viewer/
 
 | Gesto | Effetto |
 |---|---|
+| Palmo **sinistro** rivolto verso il viso + pinza **indice + pollice** | Apre / chiude il menu (ha la priorità sul teletrasporto) |
 | Pinza **indice + pollice** puntando il pavimento, poi rilascia | Teletrasporto nel punto mirato |
 | Pinza **indice + pollice** puntando una porta | Apre / chiude la porta |
 | Pinza **indice + pollice** sul menu | Preme il bottone puntato |

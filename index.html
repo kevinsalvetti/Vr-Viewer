@@ -38,7 +38,7 @@
   <div style="font-size:12px;margin-top:10px;opacity:.8">
     VR: stick sinistro = muoversi · stick destro ←→ = ruota · stick destro ↑↓ = su/giù · grip (lato) = velocità x3 · GRILLETTO = teletrasporto (tieni premuto, punta il pavimento, rilascia)
   <br><b>Mani (senza controller):</b> pinza indice+pollice = teletrasporto · pinza medio+pollice con la sinistra (o la destra, si sceglie dal menu in VR) e muovi la mano avanti/indietro = cammini avanti/indietro
-  <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · punta un bottone e premi il grilletto
+  <br><b>Menu:</b> tasto menu (≡) o Y del controller sinistro = apri/chiudi · con le mani: palmo sinistro verso il viso + pinza indice+pollice = apri/chiudi · punta un bottone e premi il grilletto (o fai la pinza)
   <br><b>Porte:</b> punta la porta e premi il grilletto (o pinza indice+pollice) = apri/chiudi · si apre sempre nello stesso verso · se il verso o il cardine è sbagliato tieni premuto 1 secondo e rilascia: prova la combinazione successiva (4 in tutto, viene ricordata) · porte scorrevoli: stesso gesto, l'anta scorre di lato; tieni premuto 1 secondo = scorre dall'altra parte</div>
 </div>
 
@@ -4927,6 +4927,22 @@ function rayBlocked(c){
   return !!segmentHit(headW(_headRay), cLocal.setFromMatrixPosition(c.matrixWorld), cQ);
 }
 
+// gesto menu (come sul Quest): mano SINISTRA tracciata con il palmo rivolto verso il viso.
+// In questa posa il pizzico indice+pollice apre/chiude il menu invece di teletrasportare.
+// Nelle articolazioni WebXR l'asse -Y punta verso il palmo.
+const _pmW = new THREE.Vector3(), _pmN = new THREE.Vector3(), _pmH = new THREE.Vector3();
+function palmMenuPose(i){
+  const st = handStates[i];
+  if (!st || st.handed !== 'left' || !st.hand.visible) return false;
+  const j = st.hand.joints['middle-finger-metacarpal'] || st.hand.joints['wrist'];
+  if (!j || !j.visible) return false;
+  j.updateWorldMatrix(true, false);
+  _pmW.setFromMatrixPosition(j.matrixWorld);
+  _pmN.set(0, -1, 0).transformDirection(j.matrixWorld);
+  _pmH.setFromMatrixPosition(renderer.xr.getCamera(camera).matrixWorld).sub(_pmW).normalize();
+  return _pmN.dot(_pmH) > 0.6;                                   // entro ~50° dalla direzione del viso
+}
+
 for (let i = 0; i < 2; i++) {
   const c = renderer.xr.getController(i);
   const ctrlLine = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: 0xffffff }));
@@ -4938,6 +4954,10 @@ for (let i = 0; i < 2; i++) {
     c.userData.line = c.userData.isHand ? handRay : ctrlLine;
   });
   c.addEventListener('selectstart', () => {
+    if (c.userData.isHand && palmMenuPose(i)) {     // priorita': palmo sinistro verso il viso = apri/chiudi menu
+      vrMenu.open ? closeMenu() : openMenu();
+      return;
+    }
     if (vrMenu.open) { menuClick(c); return; }      // menu aperto: il grilletto preme i bottoni
     const line = c.userData.line;
     const p = pickDoor(c);
@@ -5237,6 +5257,7 @@ function updateHandRays(){
     const s = handStates[i].pinchStrength;
     ray.material.uniforms.opacity.value = 0.25 + 0.6 * s;
     if (aim.c === c || (doorPress && doorPress.c === c)) continue;   // teletrasporto / porta: gestiti altrove
+    if (palmMenuPose(i)) { ray.visible = false; continue; }          // posa menu: niente raggio, il pizzico apre il menu
     ray.visible = !rayBlocked(c); ray.quaternion.identity(); ray.scale.z = 0.6; ray.material.color.set(0xffffff);
   }
 }
