@@ -5280,7 +5280,7 @@ function updateAim(t, dt){
   if (len > 1e-4) { line.quaternion.setFromUnitVectors(MINUS_Z, aimLocal.divideScalar(len)); line.scale.z = len; }
 }
 
-// ---- Misure con i controller (tasto Grip, l'impugnatura) ----
+// ---- Misure: controller (tasto Grip) o mano (pinza medio+pollice della mano opposta alla camminata) ----
 // Tieni premuto il Grip: compare un raggio giallo con un pallino dove punti. Rilascia = primo punto.
 // Tieni di nuovo premuto: la linea segue il raggio e mostra la distanza dal vivo. Rilascia = misura fissata.
 // Tra il primo e il secondo punto puoi muoverti o teletrasportarti (per misure lunghe).
@@ -5386,14 +5386,22 @@ const pendingDot = makeDot(mDotMat);
 const measureCtrl = [0, 1].map(i => {
   const ray = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: MEASURE_COLOR, depthTest: false, transparent: true }));
   ray.renderOrder = 989; ray.visible = false; renderer.xr.getController(i).add(ray);
-  return { ray, cursor: makeDot(mDotMat), held: false, ok: false, undoPrev: false, p: new THREE.Vector3() };
+  return { ray, cursor: makeDot(mDotMat), held: false, ok: false, undoPrev: false, p: new THREE.Vector3(),
+           dir: new THREE.Vector3(), hist: [] };   // dir/hist: solo con le mani
 });
+// Mano che misura con la pinza medio+pollice: l'altra rispetto alla camminata fluida (scelta nel menu).
+// La pinza indice+pollice di quella mano resta com'era (teletrasporto, porte, menu, X delle misure).
+const measureHand = () => walkHand === 'left' ? 'right' : 'left';
+const isMeasureHand = i => !!handStates[i] && handStates[i].handed === measureHand();
+const HAND_RELEASE_BACK = 150;                           // ms: aprendo la pinza il raggio "scatta", si usa il punto di prima
 
-// punto del modello mirato dal controller c (in out), agganciato al vertice piu' vicino se e' a pochi cm
-function measureAim(c, out){
+// punto del modello mirato dal controller c (in out), agganciato al vertice piu' vicino se e' a pochi cm.
+// dir (facoltativo): direzione gia' smorzata, al posto di quella del controller (mani)
+function measureAim(c, out, dir){
   if (!model || rayBlocked(c)) return null;
   c.updateWorldMatrix(true, true);
-  _mO.setFromMatrixPosition(c.matrixWorld); _mD.set(0, 0, -1).transformDirection(c.matrixWorld);
+  _mO.setFromMatrixPosition(c.matrixWorld);
+  if (dir) _mD.copy(dir); else _mD.set(0, 0, -1).transformDirection(c.matrixWorld);
   const h = castRay(_mO, _mD, 40);
   if (!h) return null;
   out.copy(h.point);
@@ -5444,7 +5452,8 @@ function clearMeasures(){
   for (const st of measureCtrl) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; }
 }
 
-function updateMeasure(){
+const _mRaw = new THREE.Vector3(), _mLocal = new THREE.Vector3(), _mInv = new THREE.Matrix4();
+function updateMeasure(dt){
   const session = renderer.xr.getSession();
   let live = false;
   // "X" puntata: si ingrandisce e il raggio del controller la indica (premi il grilletto per cancellare)
@@ -5464,16 +5473,36 @@ function updateMeasure(){
   }
   for (let i = 0; i < 2; i++) {
     const st = measureCtrl[i], c = renderer.xr.getController(i), src = session && session.inputSources[i];
-    const gp = src && !src.hand ? src.gamepad : null;    // per ora solo con i controller (non con le mani)
-    if (!gp) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; st.undoPrev = false; continue; }
-    const undo = !!(gp.buttons[4] && gp.buttons[4].pressed);   // A (destro) / X (sinistro)
-    if (undo && !st.undoPrev && !vrMenu.open) undoMeasure();
-    st.undoPrev = undo;
-    const grip = !vrMenu.open && !!(gp.buttons[1] && gp.buttons[1].pressed);
+    const gp = src && !src.hand ? src.gamepad : null;    // controller: tasto Grip
+    const hand = !!(src && src.hand) && isMeasureHand(i);   // mano: pinza medio+pollice della mano che misura
+    if (!gp && !hand) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; st.undoPrev = false; continue; }
+    if (gp) {
+      const undo = !!(gp.buttons[4] && gp.buttons[4].pressed);   // A (destro) / X (sinistro)
+      if (undo && !st.undoPrev && !vrMenu.open) undoMeasure();
+      st.undoPrev = undo;
+    }
+    const grip = !vrMenu.open && (gp ? !!(gp.buttons[1] && gp.buttons[1].pressed) : handStates[i].measPinch);
     if (grip) {
-      const h = measureAim(c, st.p);
+      let dir = null;
+      if (hand) {                                        // mano: direzione smorzata (toglie il tremolio)
+        c.updateWorldMatrix(true, true); _mRaw.set(0, 0, -1).transformDirection(c.matrixWorld);
+        if (!st.held) { st.dir.copy(_mRaw); st.hist.length = 0; }
+        else st.dir.lerp(_mRaw, 1 - Math.exp(-dt * 12)).normalize();
+        dir = st.dir;
+      }
+      const h = measureAim(c, st.p, dir);
       st.ok = !!h;
+      if (hand) {                                        // ultimi punti mirati, per il rilascio della pinza
+        const now = performance.now();
+        st.hist.push({ t: now, ok: st.ok, p: st.p.clone() });
+        while (st.hist.length > 1 && now - st.hist[1].t > HAND_RELEASE_BACK) st.hist.shift();
+        c.userData.handRay.visible = false;              // al posto del raggio bianco della mano, quello giallo
+      }
       st.ray.visible = true; st.ray.scale.z = h ? h.dist : 5;
+      if (dir) {                                         // il raggio giallo segue la direzione smorzata
+        _mLocal.copy(dir).transformDirection(_mInv.copy(c.matrixWorld).invert());
+        st.ray.quaternion.setFromUnitVectors(MINUS_Z, _mLocal);
+      } else st.ray.quaternion.identity();
       st.cursor.visible = !!h;
       if (h) {
         st.cursor.position.copy(st.p); st.cursor.material = h.snapped ? mSnapMat : mDotMat;
@@ -5481,8 +5510,11 @@ function updateMeasure(){
       }
     } else if (st.held) {                                // appena rilasciato: fissa il punto mirato
       st.ray.visible = st.cursor.visible = false;
+      if (hand && st.hist.length) {                      // mano: il punto di ~150 ms prima di aprire la pinza
+        const s = st.hist[0]; st.ok = s.ok; st.p.copy(s.p);
+      }
       if (st.ok) placeMeasurePoint(st.p);
-      st.ok = false;
+      st.ok = false; st.hist.length = 0;
     }
     st.held = grip;
   }
@@ -5515,6 +5547,7 @@ const HAND_FILL_LOW = new THREE.Color(0x4a4f55);  // un po' piu' chiaro verso il
 const HAND_EDGE = new THREE.Color(0xc9ccd0);     // bordo chiaro
 const HAND_PINCH = new THREE.Color(0x7fd8ff);    // azzurro: pinza indice (teletrasporto)
 const HAND_MOVE = new THREE.Color(0xffa64d);     // arancio: pinza medio (movimento)
+const HAND_MEASURE = new THREE.Color(0xc86bff);  // viola: pinza medio della mano che misura (diverso da arancio e azzurro)
 const HAND_EDGE_WIDTH = 0.0016;                  // spessore del bordo in metri
 
 const handVS = `
@@ -5619,9 +5652,9 @@ function updateHandVisual(st){
   _wW.add(off);
   for (const m of v.matList) { m.uniforms.wrist.value.copy(_wW); m.uniforms.dir.value.copy(dir); }
   const f = v.mats.fill.uniforms;
-  if (st.pinching) {                                         // pinza medio+pollice: arancio
+  if (st.pinching || st.measPinch) {                         // pinza medio+pollice: arancio (camminata) / viola (misura)
     J['middle-finger-tip'].getWorldPosition(f.g1.value); J['thumb-tip'].getWorldPosition(f.g2.value);
-    f.glowColor.value.copy(HAND_MOVE); f.glow.value = 0.85;
+    f.glowColor.value.copy(st.measPinch ? HAND_MEASURE : HAND_MOVE); f.glow.value = 0.85;
   } else if (st.pinchStrength > 0 && J['index-finger-tip']) { // pinza indice+pollice: azzurro graduale
     J['index-finger-tip'].getWorldPosition(f.g1.value); J['thumb-tip'].getWorldPosition(f.g2.value);
     f.glowColor.value.copy(HAND_PINCH); f.glow.value = 0.85 * st.pinchStrength;
@@ -5650,7 +5683,7 @@ for (let i = 0; i < 2; i++) {
   const hand = renderer.xr.getHand(i);
   rig.add(hand);
   const st = { hand, handed: null, pinching: false, pinchStrength: 0, anchor: new THREE.Vector3(), vis: null, handRoot: null };
-  hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = false; st.pinchStrength = 0; });
+  hand.addEventListener('disconnected', () => { st.handed = null; st.pinching = st.measPinch = false; st.pinchStrength = 0; });
   handStates.push(st);
 }
 
@@ -5784,13 +5817,22 @@ function handsLoop(dt){
   hf.y = 0; hf.normalize(); hr.crossVectors(hf, up).normalize();
   for (const st of handStates) {
     const hand = st.hand, J = hand.joints;
-    if (!st.handed || !hand.visible) { st.pinching = false; st.pinchStrength = 0; continue; }
+    if (!st.handed || !hand.visible) { st.pinching = st.measPinch = false; st.pinchStrength = 0; continue; }
     const mid = J['middle-finger-tip'], thumb = J['thumb-tip'], index = J['index-finger-tip'];
     // quanto sono vicini indice e pollice (0 = aperti, 1 = pinza chiusa): illumina i polpastrelli e il raggio
     st.pinchStrength = (index && thumb) ?
       Math.min(Math.max((0.06 - index.position.distanceTo(thumb.position)) / 0.04, 0), 1) : 0;
     // la pinza medio+pollice (camminata) vale solo per la mano scelta nel menu
-    if (st.handed !== walkHand || !mid || !thumb || !mid.visible || !thumb.visible) { st.pinching = false; updateHandVisual(st); continue; }
+    if (st.handed !== walkHand || !mid || !thumb || !mid.visible || !thumb.visible) {
+      st.pinching = false;
+      // sulla mano che misura la pinza medio+pollice fa le misure (vedi updateMeasure), stesse soglie della camminata
+      if (st.handed === measureHand() && mid && thumb && mid.visible && thumb.visible) {
+        const d = mid.position.distanceTo(thumb.position);
+        if (!st.measPinch && d < 0.025) st.measPinch = true; else if (st.measPinch && d > 0.04) st.measPinch = false;
+      } else st.measPinch = false;
+      updateHandVisual(st); continue;
+    }
+    st.measPinch = false;
     const dist = mid.position.distanceTo(thumb.position);
     if (!st.pinching && dist < 0.025) { st.pinching = true; st.anchor.copy(mid.position); }
     else if (st.pinching && dist > 0.04) st.pinching = false;
@@ -5950,7 +5992,7 @@ renderer.setAnimationLoop(t => {
   try { handsLoop(dt); updateHandRays(); } catch (e) { logOnce('mani', e); }
   try { updateControllers(); } catch (e) { logOnce('controller', e); }
   try { updateMenu(); } catch (e) { logOnce('menu', e); }
-  try { updateMeasure(); } catch (e) { logOnce('misure', e); }
+  try { updateMeasure(dt); } catch (e) { logOnce('misure', e); }
   try { resolveBody(); } catch (e) { logOnce('collisioni', e); }
   try { followGround(dt); } catch (e) { logOnce('pavimento', e); }
   try { if (plan.on && !renderer.xr.isPresenting) renderPlan(); else renderer.render(scene, camera); } catch (e) { logOnce('render', e); }

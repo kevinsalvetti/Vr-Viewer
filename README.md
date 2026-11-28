@@ -8,8 +8,9 @@ https://kevinsalvetti.github.io/Vr-Viewer/
 | Palmo **destro** rivolto verso il viso + pinza **indice + pollice** | Gesto Home del Quest (il viewer lo ignora: niente teletrasporto) |
 | Pinza **indice + pollice** puntando il pavimento, poi rilascia | Teletrasporto nel punto mirato |
 | Pinza **indice + pollice** puntando una porta | Apre / chiude la porta |
+| Pinza **medio + pollice** dell'**altra mano** (la destra, se la camminata è sulla sinistra) | Misura: vedi sotto |
 | Pinza **indice + pollice** sul menu | Preme il bottone puntato |
-| Pinza **medio + pollice** e sposta la mano avanti / indietro | Camminata fluida avanti / indietro |
+| Pinza **medio + pollice** della mano della camminata (sinistra di default) e sposta la mano avanti / indietro | Camminata fluida avanti / indietro |
 
 **Camminata fluida**
 - Funziona con una sola mano, la **sinistra** di default.
@@ -19,15 +20,17 @@ https://kevinsalvetti.github.io/Vr-Viewer/
 - I muri non si attraversano.
 - Con il menu aperto non ci si muove.
 
-## Misure con i controller
+## Misure (controller o mani)
+
+Con i controller si usa il **Grip**. Con le mani si usa la pinza **medio + pollice** della mano che **non** fa la camminata fluida: la destra se la camminata è sulla sinistra (default), la sinistra se la camminata è sulla destra. I polpastrelli diventano **viola** (arancioni nella camminata, azzurri nella pinza indice + pollice). La pinza indice + pollice resta per teletrasporto, porte e menu.
 
 | Comando | Effetto |
 |---|---|
-| Tieni premuto **Grip** (impugnatura) | Raggio giallo con un pallino sul punto mirato |
-| Rilascia **Grip** | Fissa il primo punto |
-| Tieni premuto di nuovo **Grip** | La linea segue il raggio e mostra la distanza dal vivo |
-| Rilascia **Grip** | Fissa la misura, che resta visibile |
-| Punta la **X** rossa accanto a una misura + **grilletto** | Cancella solo quella misura |
+| Tieni premuto **Grip** (impugnatura) / tieni la pinza | Raggio giallo con un pallino sul punto mirato |
+| Rilascia **Grip** / apri la pinza | Fissa il primo punto |
+| Tieni premuto di nuovo **Grip** / rifai la pinza | La linea segue il raggio e mostra la distanza dal vivo |
+| Rilascia **Grip** / apri la pinza | Fissa la misura, che resta visibile |
+| Punta la **X** rossa accanto a una misura + **grilletto** / pinza indice + pollice | Cancella solo quella misura |
 | **A** / **X** | Annulla l'ultimo punto o l'ultima misura |
 | Menu → **Cancella misure** | Toglie tutte le misure |
 
