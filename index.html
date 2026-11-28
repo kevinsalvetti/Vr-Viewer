@@ -4948,12 +4948,15 @@ const _bMin = new THREE.Vector3(), _bMax = new THREE.Vector3();
 // Si prende solo il contatto piu' profondo e si spinge esattamente quanto serve per tornare a filo:
 // un muro e' fatto di molti triangoli, e sommare le spinte di tutti faceva "rimbalzare" indietro.
 // Gli angoli (due muri insieme) si risolvono con piu' passaggi in resolveBody.
-function wallPush(c, r, out){
+// ignoreAbove: per la testa si ignorano le superfici che stanno tutte sopra gli occhi (bordo del solaio
+// sopra una scala, travi): prima una persona alta restava bloccata sul pianerottolo dove ci passa.
+function wallPush(c, r, out, ignoreAbove){
   out.set(0, 0, 0);
   let best = 0;
   _bMin.set(c.x - r, c.y - r, c.z - r); _bMax.set(c.x + r, c.y + r, c.z + r);
   forTrisIn(_bMin, _bMax, (a, b, cc, isWall) => {
     if (!isWall) return;
+    if (ignoreAbove && a.y > c.y && b.y > c.y && cc.y > c.y) return;
     cTri.set(a, b, cc); cTri.closestPointToPoint(c, cQ);
     // contatto vero solo se la superficie entra nella sfera (anche in altezza): prima si guardava solo la
     // distanza orizzontale, e il frontalino del gradino davanti, sotto il busto, bloccava la salita delle scale
@@ -5074,11 +5077,14 @@ function resolveBody(){
   if (!collOn()) return;
   _want.subVectors(rig.position, _rigStart);             // spostamento chiesto in questo fotogramma
   const head = headW(_headBody);
+  // Le sfere non scendono mai all'altezza dei gradini: da seduti (testa a ~1,1 m) il busto finiva a 20 cm
+  // da terra, toccava il frontalino del primo gradino e bloccava la salita (la discesa invece funzionava).
+  const minY = rig.position.y - (floorMode ? 0 : (parseFloat(eyeIn.value) || 1.6)) + GROUND.STEP_UP + COLL.radius;
   for (let part = 0; part < 2; part++) {                 // testa e busto
     const dy = part ? -COLL.torso : 0;
     for (let it = 0; it < 6; it++) {
-      cP.copy(head); cP.y += dy;
-      wallPush(cP, COLL.radius, cPush);
+      cP.copy(head); cP.y = Math.max(cP.y + dy, minY);
+      wallPush(cP, COLL.radius, cPush, part === 0);
       if (cPush.lengthSq() < 1e-8) break;               // meno di 0,1 mm: gia' a filo
       rig.position.add(cPush); head.add(cPush);
     }
