@@ -5086,6 +5086,37 @@ function resolveBody(){
   if (_want.lengthSq() > 1e-10 && _net.dot(_want) < 0) { rig.position.x = _rigStart.x; rig.position.z = _rigStart.z; }
 }
 
+// ---- Seguire il pavimento: salire e scendere le scale camminando ----
+// A ogni fotogramma un raggio verso il basso, sotto la testa, trova il pavimento (gradino, rampa, solaio).
+//  - piu' alto di al massimo STEP_UP (un gradino): si sale in modo morbido
+//  - piu' basso di poco: si scende in modo morbido; molto piu' basso: si cade con la gravita'
+//  - niente sotto (fuori dal modello): si resta alla stessa quota
+const GROUND = { STEP_UP: 0.5, FAR: 6, vy: 0 };
+const _gO = new THREE.Vector3(), _gDown = new THREE.Vector3(0, -1, 0), _gHead = new THREE.Vector3();
+function followGround(dt){
+  if (!renderer.xr.isPresenting || !model || !COLL.T || dt <= 0) return;
+  const eyeOff = floorMode ? 0 : (parseFloat(eyeIn.value) || 1.6);
+  const feet = rig.position.y - eyeOff;                  // quota dei piedi nel modello
+  const head = headW(_gHead);
+  _gO.set(head.x, feet + GROUND.STEP_UP, head.z);
+  const h = castRay(_gO, _gDown, GROUND.STEP_UP + GROUND.FAR);
+  if (!h || Math.abs(h.normal.y) < 0.7) { GROUND.vy = 0; return; }   // niente pavimento sotto: resto dove sono
+  const diff = h.point.y - feet;
+  if (diff > 0.002) {                                    // gradino in salita
+    GROUND.vy = 0;
+    rig.position.y += Math.min(diff, Math.max(diff * (1 - Math.exp(-dt * 14)), 0.6 * dt));
+  } else if (diff < -0.002) {
+    if (diff > -GROUND.STEP_UP && GROUND.vy === 0) {     // gradino in discesa: morbido come in salita
+      rig.position.y += Math.max(diff, Math.min(diff * (1 - Math.exp(-dt * 14)), -0.6 * dt));
+    } else {                                             // dislivello grande: caduta con la gravita'
+      GROUND.vy = Math.min(GROUND.vy + 9.8 * dt, 8);
+      rig.position.y += Math.max(diff, -GROUND.vy * dt);
+      if (rig.position.y - eyeOff <= h.point.y + 0.002) GROUND.vy = 0;
+    }
+  } else GROUND.vy = 0;
+}
+renderer.xr.addEventListener('sessionstart', () => { GROUND.vy = 0; });
+
 // la mano non entra nei muri: se un dito andrebbe oltre una superficie, tutta la mano si ferma li'
 const HAND_TIPS = ['wrist', 'thumb-tip', 'index-finger-tip', 'middle-finger-tip', 'ring-finger-tip', 'pinky-finger-tip'];
 const _hp = new THREE.Vector3(), _hh = new THREE.Vector3(), _ho = new THREE.Vector3(), _hq = new THREE.Quaternion();
@@ -5682,6 +5713,7 @@ renderer.setAnimationLoop(t => {
   try { updateControllers(); } catch (e) { logOnce('controller', e); }
   try { updateMenu(); } catch (e) { logOnce('menu', e); }
   try { resolveBody(); } catch (e) { logOnce('collisioni', e); }
+  try { followGround(dt); } catch (e) { logOnce('pavimento', e); }
   try { if (plan.on && !renderer.xr.isPresenting) renderPlan(); else renderer.render(scene, camera); } catch (e) { logOnce('render', e); }
 });
 
