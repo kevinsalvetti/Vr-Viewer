@@ -4955,8 +4955,11 @@ function wallPush(c, r, out){
   forTrisIn(_bMin, _bMax, (a, b, cc, isWall) => {
     if (!isWall) return;
     cTri.set(a, b, cc); cTri.closestPointToPoint(c, cQ);
+    // contatto vero solo se la superficie entra nella sfera (anche in altezza): prima si guardava solo la
+    // distanza orizzontale, e il frontalino del gradino davanti, sotto il busto, bloccava la salita delle scale
+    const pen = r - c.distanceTo(cQ);
     cD.subVectors(c, cQ); cD.y = 0;
-    const dist = cD.length(), pen = r - dist;
+    const dist = cD.length();
     if (pen > best && dist > 1e-5) { best = pen; out.copy(cD).multiplyScalar(pen / dist); }
   });
   return out;
