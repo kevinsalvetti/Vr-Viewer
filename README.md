@@ -18,3 +18,20 @@ https://kevinsalvetti.github.io/Vr-Viewer/
 - La direzione è quella in cui guardi.
 - I muri non si attraversano.
 - Con il menu aperto non ci si muove.
+
+## Misure con i controller
+
+| Comando | Effetto |
+|---|---|
+| Tieni premuto **Grip** (impugnatura) | Raggio giallo con un pallino sul punto mirato |
+| Rilascia **Grip** | Fissa il primo punto |
+| Tieni premuto di nuovo **Grip** | La linea segue il raggio e mostra la distanza dal vivo |
+| Rilascia **Grip** | Fissa la misura, che resta visibile |
+| Punta la **X** rossa accanto a una misura + **grilletto** | Cancella solo quella misura |
+| **A** / **X** | Annulla l'ultimo punto o l'ultima misura |
+| Menu → **Cancella misure** | Toglie tutte le misure |
+
+- Le distanze sono in metri reali: la scena è in scala 1:1, purché la "scala" del modello sia impostata bene.
+- Vicino a un vertice del modello (spigoli, angoli) il punto si aggancia al vertice e il pallino diventa azzurro.
+- Tra il primo e il secondo punto puoi muoverti o teletrasportarti, per misurare distanze lunghe.
+- La corsa (velocità ×3 con la levetta sinistra) ora si attiva premendo la levetta, non più con il Grip.

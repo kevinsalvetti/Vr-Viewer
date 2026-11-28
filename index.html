@@ -4442,6 +4442,7 @@ function loadFile(f){
     done();
     if (seq !== loadSeq) { disposeModel(gltf.scene); return; }   // nel frattempo e' stato scelto un altro file
     if (model) { scene.remove(model); disposeModel(model); }
+    clearMeasures();
     doors.length = 0; Object.assign(COLL, { T: null, wall: null, owner: null, objs: [], grid: null, seen: null, key: '' });
     model = gltf.scene;
     model.traverse(o => { if (o.isMesh && o.material) {
@@ -4678,7 +4679,8 @@ function locomotion(dt){
     const gp = src.gamepad;
     if (!gp || gp.axes.length < 4) continue;
     const x = gp.axes[2], y = gp.axes[3];
-    const boost = (gp.buttons[1] && gp.buttons[1].pressed) ? 3 : 1;
+    // corsa: levetta premuta (il Grip ora serve per le misure)
+    const boost = (gp.buttons[3] && gp.buttons[3].pressed) ? 3 : 1;
     if (src.handedness === 'left') {
       if (Math.abs(x) > dead) rig.position.addScaledVector(right, x * 2 * boost * dt);
       if (Math.abs(y) > dead) rig.position.addScaledVector(fwd, -y * 2 * boost * dt);
@@ -4996,7 +4998,7 @@ function castRay(o, d, far){
     const h = ray.intersectObject(model, true)[0];
     ray.far = 40;
     if (!h) return null;
-    HIT.t = h.distance; HIT.point.copy(h.point); HIT.obj = h.object; HIT.door = null;
+    HIT.t = h.distance; HIT.point.copy(h.point); HIT.obj = h.object; HIT.door = null; HIT.A = null;
     HIT.normal.copy(h.face.normal).transformDirection(h.object.matrixWorld);
     return HIT;
   }
@@ -5042,6 +5044,7 @@ function castRay(o, d, far){
   HIT.normal.set(uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx).normalize();
   HIT.t = best; HIT.point.set(ox + dx * best, oy + dy * best, oz + dz * best);
   HIT.door = bestDoor; HIT.obj = bestDoor ? bestDoor.obj : COLL.objs[COLL.owner[bestTri]];
+  HIT.A = A; HIT.k = k;                                  // triangolo colpito (vertici A[k..k+8]): serve alle misure
   return HIT;
 }
 
@@ -5197,6 +5200,8 @@ for (let i = 0; i < 2; i++) {
     }
     if (c.userData.isHand && palmHomePose(i)) return;   // priorita': palmo destro verso il viso = gesto Home del Quest
     if (vrMenu.open) { menuClick(c); return; }      // menu aperto: il grilletto preme i bottoni
+    const mx = measureXPick(c);
+    if (mx) { deleteMeasure(mx.v); measureCtrl[i].xLine = true; return; }   // "X" di una misura: cancella solo quella
     const line = c.userData.line;
     const p = pickDoor(c);
     if (p) {                                        // puntando una porta: apri/chiudi invece del teletrasporto
@@ -5274,6 +5279,227 @@ function updateAim(t, dt){
   const len = aimLocal.length();
   if (len > 1e-4) { line.quaternion.setFromUnitVectors(MINUS_Z, aimLocal.divideScalar(len)); line.scale.z = len; }
 }
+
+// ---- Misure con i controller (tasto Grip, l'impugnatura) ----
+// Tieni premuto il Grip: compare un raggio giallo con un pallino dove punti. Rilascia = primo punto.
+// Tieni di nuovo premuto: la linea segue il raggio e mostra la distanza dal vivo. Rilascia = misura fissata.
+// Tra il primo e il secondo punto puoi muoverti o teletrasportarti (per misure lunghe).
+// Vicino a un vertice del modello (spigoli, angoli) il punto si aggancia: pallino azzurro.
+// A / X = annulla l'ultimo punto o l'ultima misura. "Cancella misure" nel menu le toglie tutte.
+// La scena e' in scala 1:1, quindi le distanze sono in metri reali (se la "scala" del modello e' giusta).
+const MEASURE_COLOR = 0xffd34d, MEASURE_SNAP = 0x4dd2ff;
+const MEASURE_LABEL_H = 0.07;                            // altezza dell'etichetta in metri (larga 3,2 volte tanto)
+const measureRoot = new THREE.Group(); scene.add(measureRoot);
+const mSegGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true);   // asse Y, centrato: si scala sulla lunghezza
+const mDotGeo = new THREE.SphereGeometry(1, 12, 8);
+const mMat = color => new THREE.MeshBasicMaterial({ color, depthTest: false, depthWrite: false, transparent: true, opacity: 0.95 });
+const mLineMat = mMat(MEASURE_COLOR), mDotMat = mMat(MEASURE_COLOR), mSnapMat = mMat(MEASURE_SNAP);
+const measures = [];                                     // misure fissate: { vis, a, b }
+let measurePending = null;                               // primo punto gia' messo, in attesa del secondo
+const _mY = new THREE.Vector3(0, 1, 0), _mO = new THREE.Vector3(), _mD = new THREE.Vector3(), _mV = new THREE.Vector3(),
+      _mHead = new THREE.Vector3(), _mMid = new THREE.Vector3();
+
+function makeDot(mat){
+  const m = new THREE.Mesh(mDotGeo, mat); m.renderOrder = 990; m.visible = false; m.scale.setScalar(0.01);
+  measureRoot.add(m); return m;
+}
+// "X" per cancellare una sola misura: un cerchietto accanto all'etichetta, rivolto sempre verso di te.
+// Puntalo e premi il grilletto. Diventa piu' grande e acceso quando lo stai puntando.
+const mXGeo = new THREE.PlaneGeometry(1, 1);
+const mXTex = (() => {
+  const cv = document.createElement('canvas'); cv.width = cv.height = 128;
+  const g = cv.getContext('2d');
+  g.beginPath(); g.arc(64, 64, 58, 0, Math.PI * 2); g.fillStyle = 'rgba(192,69,58,0.95)'; g.fill();
+  g.lineWidth = 5; g.strokeStyle = 'rgba(255,255,255,0.85)'; g.stroke();
+  g.lineWidth = 14; g.lineCap = 'round'; g.strokeStyle = '#fff';
+  g.beginPath(); g.moveTo(40, 40); g.lineTo(88, 88); g.moveTo(88, 40); g.lineTo(40, 88); g.stroke();
+  return new THREE.CanvasTexture(cv);
+})();
+const _mRight = new THREE.Vector3(), _mToHead = new THREE.Vector3();
+// linea + due estremi + etichetta con la distanza (sprite che guarda sempre verso di te); withX = con la "X"
+function makeMeasureVis(withX){
+  const g = new THREE.Group();
+  const seg = new THREE.Mesh(mSegGeo, mLineMat); seg.renderOrder = 989;
+  const ea = new THREE.Mesh(mDotGeo, mDotMat), eb = new THREE.Mesh(mDotGeo, mDotMat); ea.renderOrder = eb.renderOrder = 990;
+  const cv = document.createElement('canvas'); cv.width = 512; cv.height = 160;
+  const tex = new THREE.CanvasTexture(cv);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, depthWrite: false, transparent: true }));
+  sprite.renderOrder = 991;                              // sotto il menu (1000), sopra tutto il resto
+  g.add(seg, ea, eb, sprite); measureRoot.add(g);
+  let x = null;
+  if (withX) {
+    x = new THREE.Mesh(mXGeo, new THREE.MeshBasicMaterial({ map: mXTex, depthTest: false, depthWrite: false, transparent: true, opacity: 0.8 }));
+    x.renderOrder = 992; g.add(x);
+  }
+  return { g, seg, ea, eb, sprite, x, hover: false, ctx: cv.getContext('2d'), tex, text: '', a: new THREE.Vector3(), b: new THREE.Vector3() };
+}
+function disposeMeasureVis(v){ measureRoot.remove(v.g); v.tex.dispose(); v.sprite.material.dispose(); if (v.x) v.x.material.dispose(); }
+const fmtMeasure = d => d.toFixed(2).replace('.', ',') + ' m';
+function setMeasureVis(v, a, b){
+  v.a.copy(a); v.b.copy(b);
+  const len = a.distanceTo(b);
+  v.seg.position.addVectors(a, b).multiplyScalar(0.5);
+  if (len > 1e-6) v.seg.quaternion.setFromUnitVectors(_mY, _mV.subVectors(b, a).divideScalar(len));
+  v.seg.scale.set(1, Math.max(len, 1e-4), 1);
+  v.ea.position.copy(a); v.eb.position.copy(b);
+  const text = fmtMeasure(len);
+  if (text !== v.text) {                                 // ridisegna l'etichetta solo se il numero cambia
+    v.text = text;
+    const g = v.ctx, W = 512, H = 160;
+    g.clearRect(0, 0, W, H);
+    roundRect(g, 4, 4, W - 8, H - 8, 40); g.fillStyle = 'rgba(18,22,28,0.88)'; g.fill();
+    g.lineWidth = 5; g.strokeStyle = 'rgba(255,211,77,0.9)'; g.stroke();
+    let fs = 96; g.font = 'bold ' + fs + 'px system-ui, sans-serif';
+    while (fs > 40 && g.measureText(text).width > W - 60) { fs -= 4; g.font = 'bold ' + fs + 'px system-ui, sans-serif'; }
+    g.fillStyle = '#ffd34d'; g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText(text, W / 2, H / 2 + 4);
+    v.tex.needsUpdate = true;
+  }
+  v.g.visible = true;
+}
+// linea e pallini crescono con la distanza dalla testa (restano visibili da lontano); etichetta e "X" no
+const mSize = (p, head, k, lo, hi) => Math.min(Math.max(p.distanceTo(head) * k, lo), hi);
+function scaleMeasureVis(v, head){
+  _mMid.addVectors(v.a, v.b).multiplyScalar(0.5);
+  const r = mSize(_mMid, head, 0.0025, 0.003, 0.03);
+  v.seg.scale.x = v.seg.scale.z = r;
+  v.ea.scale.setScalar(mSize(v.a, head, 0.006, 0.008, 0.06));
+  v.eb.scale.setScalar(mSize(v.b, head, 0.006, 0.008, 0.06));
+  const h = MEASURE_LABEL_H;                             // etichetta di misura fissa: non cresce allontanandosi
+  v.sprite.scale.set(h * 3.2, h, 1);
+  v.sprite.position.copy(_mMid); v.sprite.position.y += h * 0.75;
+  if (v.x) {                                             // la "X" a destra dell'etichetta, come la vedi tu
+    _mToHead.subVectors(head, v.sprite.position); _mToHead.y = 0;
+    if (_mToHead.lengthSq() < 1e-8) _mToHead.set(0, 0, 1);
+    _mToHead.normalize(); _mRight.crossVectors(_mY, _mToHead);
+    const s = h * (v.hover ? 0.6 : 0.48);
+    v.x.position.copy(v.sprite.position).addScaledVector(_mRight, h * 1.6 + h * 0.4);
+    v.x.scale.set(s, s, 1);
+    v.x.lookAt(head);
+    v.x.material.opacity = v.hover ? 1 : 0.8;
+  }
+}
+
+const liveMeasure = makeMeasureVis(); liveMeasure.g.visible = false;
+const pendingDot = makeDot(mDotMat);
+// per ogni controller: raggio giallo, pallino sul punto mirato, stato del Grip
+const measureCtrl = [0, 1].map(i => {
+  const ray = new THREE.Line(lineGeo, new THREE.LineBasicMaterial({ color: MEASURE_COLOR, depthTest: false, transparent: true }));
+  ray.renderOrder = 989; ray.visible = false; renderer.xr.getController(i).add(ray);
+  return { ray, cursor: makeDot(mDotMat), held: false, ok: false, undoPrev: false, p: new THREE.Vector3() };
+});
+
+// punto del modello mirato dal controller c (in out), agganciato al vertice piu' vicino se e' a pochi cm
+function measureAim(c, out){
+  if (!model || rayBlocked(c)) return null;
+  c.updateWorldMatrix(true, true);
+  _mO.setFromMatrixPosition(c.matrixWorld); _mD.set(0, 0, -1).transformDirection(c.matrixWorld);
+  const h = castRay(_mO, _mD, 40);
+  if (!h) return null;
+  out.copy(h.point);
+  let snapped = false;
+  if (h.A) {
+    let best = Math.max(0.03, h.t * 0.012);              // 3 cm da vicino, un po' di piu' da lontano
+    for (let j = 0; j < 9; j += 3) {
+      _mV.fromArray(h.A, h.k + j);
+      const d = _mV.distanceTo(h.point);
+      if (d < best) { best = d; out.copy(_mV); snapped = true; }
+    }
+  }
+  return { dist: _mO.distanceTo(out), snapped };
+}
+function placeMeasurePoint(p){
+  if (!measurePending) { measurePending = p.clone(); pendingDot.position.copy(p); pendingDot.visible = true; return; }
+  if (p.distanceTo(measurePending) < 0.005) return;      // stesso punto: aspetta un secondo punto vero
+  const vis = makeMeasureVis(true); setMeasureVis(vis, measurePending, p);
+  measures.push(vis);
+  measurePending = null; pendingDot.visible = false; liveMeasure.g.visible = false;
+}
+// misura la cui "X" e' puntata dal controller c (o null)
+const mXRay = new THREE.Raycaster();
+function measureXPick(c){
+  if (!measures.length) return null;
+  c.updateWorldMatrix(true, true);
+  _mO.setFromMatrixPosition(c.matrixWorld); _mD.set(0, 0, -1).transformDirection(c.matrixWorld);
+  mXRay.set(_mO, _mD);
+  let best = null;
+  for (const v of measures) {
+    if (!v.x) continue;
+    const h = mXRay.intersectObject(v.x)[0];
+    if (h && (!best || h.distance < best.dist)) best = { v, dist: h.distance };
+  }
+  return best;
+}
+function deleteMeasure(v){
+  const i = measures.indexOf(v); if (i < 0) return;
+  measures.splice(i, 1); disposeMeasureVis(v);
+}
+function undoMeasure(){
+  if (measurePending) { measurePending = null; pendingDot.visible = false; liveMeasure.g.visible = false; return; }
+  const v = measures.pop(); if (v) disposeMeasureVis(v);
+}
+function clearMeasures(){
+  while (measures.length) disposeMeasureVis(measures.pop());
+  measurePending = null; pendingDot.visible = false; liveMeasure.g.visible = false;
+  for (const st of measureCtrl) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; }
+}
+
+function updateMeasure(){
+  const session = renderer.xr.getSession();
+  let live = false;
+  // "X" puntata: si ingrandisce e il raggio del controller la indica (premi il grilletto per cancellare)
+  for (const v of measures) v.hover = false;
+  for (let i = 0; i < 2; i++) {
+    const st = measureCtrl[i], c = renderer.xr.getController(i), l = c.userData.line;
+    const free = session && session.inputSources[i] && !vrMenu.open && aim.c !== c && !(doorPress && doorPress.c === c);
+    const p = free ? measureXPick(c) : null;
+    if (p) {
+      p.v.hover = true;
+      l.visible = true; l.quaternion.identity(); l.scale.z = p.dist; l.material.color.set(0xff6655);
+      st.xLine = true;
+    } else if (st.xLine) {
+      st.xLine = false;
+      if (free) hideRay(c);                              // solo se il raggio non serve ad altro
+    }
+  }
+  for (let i = 0; i < 2; i++) {
+    const st = measureCtrl[i], c = renderer.xr.getController(i), src = session && session.inputSources[i];
+    const gp = src && !src.hand ? src.gamepad : null;    // per ora solo con i controller (non con le mani)
+    if (!gp) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; st.undoPrev = false; continue; }
+    const undo = !!(gp.buttons[4] && gp.buttons[4].pressed);   // A (destro) / X (sinistro)
+    if (undo && !st.undoPrev && !vrMenu.open) undoMeasure();
+    st.undoPrev = undo;
+    const grip = !vrMenu.open && !!(gp.buttons[1] && gp.buttons[1].pressed);
+    if (grip) {
+      const h = measureAim(c, st.p);
+      st.ok = !!h;
+      st.ray.visible = true; st.ray.scale.z = h ? h.dist : 5;
+      st.cursor.visible = !!h;
+      if (h) {
+        st.cursor.position.copy(st.p); st.cursor.material = h.snapped ? mSnapMat : mDotMat;
+        if (measurePending) { setMeasureVis(liveMeasure, measurePending, st.p); live = true; }
+      }
+    } else if (st.held) {                                // appena rilasciato: fissa il punto mirato
+      st.ray.visible = st.cursor.visible = false;
+      if (st.ok) placeMeasurePoint(st.p);
+      st.ok = false;
+    }
+    st.held = grip;
+  }
+  if (!live) liveMeasure.g.visible = false;
+  // niente da ridimensionare. Il pallino del Grip conta: senza, alla prima misura restava a scala 1
+  // (una sfera di 1 m di raggio attorno al punto mirato = bollino giallo grande come lo schermo)
+  if (!measures.length && !measurePending && !live && !measureCtrl.some(st => st.cursor.visible)) return;
+  const head = headW(_mHead);
+  for (const v of measures) scaleMeasureVis(v, head);
+  if (live) scaleMeasureVis(liveMeasure, head);
+  if (measurePending) pendingDot.scale.setScalar(mSize(measurePending, head, 0.006, 0.008, 0.06));
+  for (const st of measureCtrl) if (st.cursor.visible) st.cursor.scale.setScalar(mSize(st.p, head, 0.006, 0.008, 0.06));
+}
+renderer.xr.addEventListener('sessionend', () => {
+  for (const st of measureCtrl) { st.held = st.ok = false; st.ray.visible = st.cursor.visible = false; }
+  liveMeasure.g.visible = false;
+});
 
 // ---- Hand tracking (mani nude) ----
 // Aspetto come le mani di sistema del Quest: mano realistica grigio scuro, bordo chiaro sottile,
@@ -5598,12 +5824,15 @@ function updateHandRays(){
 //  - "Esci dalla VR": termina la sessione e torna alla pagina
 // Mentre il menu e' aperto non ci si muove e non si aprono porte.
 const vrMenu = { open: false, mesh: null, ctx: null, tex: null, hover: -1, prev: new WeakMap(),
-  W: 1024, H: 810, size: [0.62, 0.62 * 810 / 1024],
+  W: 1024, H: 1000, size: [0.62, 0.62 * 1000 / 1024],
   buttons: [ { label: 'Torna alla VR', x: 112, y: 190, w: 800, h: 150, color: '#2a9d6a', act: () => closeMenu() },
              { label: () => 'Camminata Fluida: mano ' + (walkHand === 'left' ? 'sinistra' : 'destra'),
                x: 112, y: 380, w: 800, h: 150, color: '#3a6fc0',
                act: () => { setWalkHand(walkHand === 'left' ? 'right' : 'left'); drawMenu(); } },
-             { label: 'Esci dalla VR', x: 112, y: 570, w: 800, h: 150, color: '#c0453a',
+             { label: () => 'Cancella misure' + (measures.length ? ' (' + measures.length + ')' : ''),
+               x: 112, y: 570, w: 800, h: 150, color: '#b08a1e',
+               act: () => { clearMeasures(); drawMenu(); } },
+             { label: 'Esci dalla VR', x: 112, y: 760, w: 800, h: 150, color: '#c0453a',
                act: () => { closeMenu(); const s = renderer.xr.getSession(); if (s) s.end(); } } ] };
 (function buildMenu(){
   const cv = document.createElement('canvas'); cv.width = vrMenu.W; cv.height = vrMenu.H;
@@ -5721,6 +5950,7 @@ renderer.setAnimationLoop(t => {
   try { handsLoop(dt); updateHandRays(); } catch (e) { logOnce('mani', e); }
   try { updateControllers(); } catch (e) { logOnce('controller', e); }
   try { updateMenu(); } catch (e) { logOnce('menu', e); }
+  try { updateMeasure(); } catch (e) { logOnce('misure', e); }
   try { resolveBody(); } catch (e) { logOnce('collisioni', e); }
   try { followGround(dt); } catch (e) { logOnce('pavimento', e); }
   try { if (plan.on && !renderer.xr.isPresenting) renderPlan(); else renderer.render(scene, camera); } catch (e) { logOnce('render', e); }
